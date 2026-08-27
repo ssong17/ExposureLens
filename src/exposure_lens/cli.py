@@ -6,6 +6,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from .candidate_filter import build_analysis_candidates
 from .config import load_config
 from .direct_collector import DirectAssetCollector
 from .pipeline import write_jsonl, write_run_summary
@@ -64,18 +65,30 @@ def main(argv: list[str] | None = None) -> int:
         run_details: dict[str, dict[str, object]] = {}
         for company in companies:
             collector = DirectAssetCollector(app, company)
-            candidates = collector.collect()
-            destination = output / f"{company.company_id}.jsonl"
-            write_jsonl(candidates, destination)
+            raw_candidates = collector.collect()
+            analysis_candidates, priority_counts = build_analysis_candidates(
+                raw_candidates
+            )
+            raw_destination = output / f"{company.company_id}_raw.jsonl"
+            candidates_destination = (
+                output / f"{company.company_id}_candidates.jsonl"
+            )
+            write_jsonl(raw_candidates, raw_destination)
+            write_jsonl(analysis_candidates, candidates_destination)
             run_details[company.company_id] = {
-                "candidate_count": len(candidates),
+                "candidate_count": len(raw_candidates),
+                "group_count": sum(priority_counts.values()),
+                "analysis_count": len(analysis_candidates),
+                "low_count": priority_counts["low"],
                 "index_request_count": collector.request_count,
                 "search_queries": collector.search_queries,
                 "errors": collector.errors,
             }
             print(
-                f"수집 완료: {company.name}, 후보 {len(candidates)}개, "
-                f"공개 색인 요청 {collector.request_count}회, 출력 {destination}"
+                f"수집 완료: {company.name}, 원본 {len(raw_candidates)}개, "
+                f"분석 후보 {len(analysis_candidates)}개, "
+                f"공개 색인 요청 {collector.request_count}회, "
+                f"출력 {candidates_destination}"
             )
             for error in collector.errors:
                 print(f"경고: {error}", file=sys.stderr)

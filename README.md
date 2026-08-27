@@ -1,10 +1,8 @@
 # ExposureLens — 기업 직접 노출 자산 URL 수집기
 
-기업이 직접 공개한 자산의 URL 후보를 제3자 공개 색인에서 수집하여 JSONL로
-저장하는 CLI 도구입니다. 모든 후보는 `DIRECT` 트랙과 `DIR_` ID를 사용합니다.
+기업이 직접 공개한 자산의 URL 후보를 제3자 공개 색인에서 수집하여 JSONL로 저장하는 CLI 도구이다. 모든 후보는 `DIRECT` 트랙과 `DIR_` ID를 사용한다.
 
-이 버전은 **URL 후보 수집만 수행**합니다. 로그인, 경로 추측, API 호출, 키 검증,
-DB 접속 및 스토리지 목록 조회는 수행하지 않습니다.
+이 버전은 **URL 후보 수집만 수행**한다. 로그인, 경로 추측, API 호출, 키 검증, DB 접속 및 스토리지 목록 조회는 수행하지 않는다.
 
 ## 프로젝트 구조
 
@@ -13,6 +11,7 @@ src/exposure_lens/
 ├── __init__.py            # Python 패키지 정의와 버전
 ├── __main__.py            # `python -m exposure_lens` 실행 진입점
 ├── cli.py                 # CLI 명령과 옵션 처리
+├── candidate_filter.py    # URL 그룹화와 분석 우선순위 분류
 ├── config.py              # TOML 설정 로드와 유효성 검사
 ├── direct_collector.py    # DIRECT 트랙 공개 색인 수집기
 ├── discovery.py           # HTML, sitemap, robots.txt 파서
@@ -25,7 +24,7 @@ src/exposure_lens/
 - `collector_tests/test_collector.py`: 설정, URL 수집과 출력 기능 테스트
 - `config.example.toml`: 설정 파일 예시
 - `config.toml`: 실제 실행 설정
-- `output/YYYYMMDD/`: 날짜별 JSONL 결과와 대상 기업 요약
+- `output/YYYYMMDD/`: 날짜별 원본·분석 후보 JSONL과 실행 요약
 - `pyproject.toml`: 패키지, 실행 명령과 개발 도구 설정
 
 ## 안전장치
@@ -40,15 +39,14 @@ src/exposure_lens/
 
 ## 시작하기
 
-Python 3.11 이상이 필요합니다.
+Python 3.11 이상이 필요하다.
 
 ```bash
 python -m pip install -e .
 cp config.example.toml config.toml
 ```
 
-`config.toml`에서 예시 기업을 실제 조사 기업으로 교체합니다. 도메인과 소유 근거를
-직접 검증한 후에만 `enabled = true`로 바꿉니다.
+`config.toml`에서 예시 기업을 실제 조사 기업으로 교체한다. 도메인과 소유 근거를 직접 검증한 후에만 `enabled = true`로 바꾼다.
 
 설정 검사:
 
@@ -70,7 +68,7 @@ exposure-lens collect \
   --company example
 ```
 
-`--company`에는 설정의 `company_id`를 입력합니다. 여러 기업은 그룹 단위로 순차 실행합니다.
+`--company`에는 설정의 `company_id`를 입력한다. 여러 기업은 그룹 단위로 순차 실행한다.
 
 ```bash
 exposure-lens collect \
@@ -78,18 +76,16 @@ exposure-lens collect \
   --group pilot
 ```
 
-결과는 `output/YYYYMMDD/`에 저장됩니다. 기업별 JSONL에는 CT, 공개 DNS,
-Common Crawl, Wayback Machine 및 공식 저장소에서 발견한 URL 후보가 기록됩니다.
-`summary.md`에는 실행 대상, 수집 방식, 출처, `site:` 검색 쿼리와 오류가 함께
-기록됩니다. 출력 상위 경로는 `--output`으로 변경할 수 있으며, 모든 활성 기업은
-`--all-enabled`로 선택할 수 있습니다.
+결과는 `output/YYYYMMDD/`에 저장된다. `_raw.jsonl`에는 공개 색인에서 발견한 URL 원문을 보존하고, `_candidates.jsonl`에는 HTTP/HTTPS, `www`, 쿼리 변형을 통합한 대표 URL과 우선순위를 기록한다. 
+뉴스·보도자료·사진 등 낮은 우선순위는 원본에만 남기고 분석 후보에서는 제외한다.
 
-수집기는 대상 기업 웹사이트에 직접 요청하지 않습니다. URL은 쿼리 문자열을 마스킹하지
-않고 저장하므로 결과 파일에 비밀정보가 포함될 수 있습니다. 결과를 외부에 공유하거나
-버전 관리에 포함하지 마세요.
+`summary.md`에는 실행 대상, 수집 방식, 출처, `site:` 검색 쿼리와 오류가 함께 기록된다. 
+출력 상위 경로는 `--output`으로 변경할 수 있으며, 모든 활성 기업은`--all-enabled`로 선택할 수 있다.
 
-`PASSIVE`는 수집 방식이지 트랙 이름이 아닙니다. 공개 색인에서 발견했더라도 기업이
-직접 공개한 자산이면 `track`은 `DIRECT`이며 후보 ID는 `DIR_`로 시작합니다.
+수집기는 대상 기업 웹사이트에 직접 요청하지 않는다. URL은 쿼리 문자열을 마스킹하지 않고 저장하므로 결과 파일에 비밀정보가 포함될 수 있다. 결과를 외부에 공유하거나 버전 관리에 포함하지 않는다.
+
+`PASSIVE`는 수집 방식이지 트랙 이름이 아니다. 
+공개 색인에서 발견했더라도 기업이 직접 공개한 자산이면 `track`은 `DIRECT`이며 후보 ID는 `DIR_`로 시작한다.
 
 ## 설정 원칙
 
@@ -103,17 +99,28 @@ Common Crawl, Wayback Machine 및 공식 저장소에서 발견한 URL 후보가
 - `company_code`: 후보 ID에 사용할 2~12자의 영문 대문자·숫자 코드
 - `groups`: 여러 기업을 순차 실행할 때 사용할 그룹 이름
 
-외부 CDN이나 저장소는 기업과의 소유·연결 관계가 검증된 경우에만 공식 자산으로
-분류합니다.
+외부 CDN이나 저장소는 기업과의 소유·연결 관계가 검증된 경우에만 공식 자산으로 분류한다.
 
 ## 출력 예시
 
 ```json
-{"candidate_id":"DIR_EXAMPLE_20260827_000001","track":"DIRECT","company_name":"예시기업","source_platform":"common_crawl","source_url":"https://index.commoncrawl.org/...","target_platform":"company_web","target_url":"https://example.com/openapi.json","discovery_method":"common_crawl","matched_indicator":"예시기업 공식 도메인","discovered_at":"2026-08-27T15:30:00+09:00","content_hint":"json"}
+{
+  "candidate_id":"DIR_EXAMPLE_20260827_000001",
+  "track":"DIRECT",
+  "company_name":"예시기업",
+  "source_platform":"common_crawl",
+  "source_url":"https://index.commoncrawl.org/...",
+  "target_platform":"company_web",
+  "target_url":"https://example.com/openapi.json",
+  "discovery_method":"common_crawl",
+  "matched_indicator":"예시기업 공식 도메인",
+  "discovered_at":"2026-08-27T15:30:00+09:00",
+  "content_hint":"json"
+}
 ```
 
-`source_url`은 후보를 제공한 공개 색인이고 `target_url`은 기업 자산 후보입니다.
-실제 노출 여부나 현재 접근 가능 여부는 검증하지 않습니다.
+`source_url`은 후보를 제공한 공개 색인이고 `target_url`은 기업 자산 후보이다.
+실제 노출 여부나 현재 접근 가능 여부는 검증하지 않는다.
 
 ## 현재 MVP의 한계
 
@@ -127,7 +134,7 @@ Common Crawl, Wayback Machine 및 공식 저장소에서 발견한 URL 후보가
 ## 트랙 확장
 
 - `DIRECT`: 기업이 직접 공개한 공식 도메인·저장소 자산
-- 제3자 트랙: 팀원이 별도 수집기로 구현할 재배포·유통 자산
+- `REDISTRIBUTION`: 팀원이 별도 수집기로 구현할 재배포·유통 자산
 
-두 트랙은 설정과 공통 후보 모델을 공유하되 수집기와 출력은 분리합니다. URL 수집과
-후속 민감정보 분석도 별도 단계로 유지합니다.
+두 트랙은 설정과 공통 후보 모델을 공유하되 수집기와 출력은 분리한다. 
+URL 수집과 후속 민감정보 분석도 별도 단계로 유지한다.

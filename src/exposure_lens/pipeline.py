@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 from .config import AppConfig, CompanyConfig
 from .discovery import discover_html, discover_robots, discover_sitemap
 from .http_client import SafeHttpClient
+from .candidate_filter import AnalysisCandidate
 from .models import Candidate, DiscoveredLink, timestamp_now
 from .urltools import (
     content_hint,
@@ -167,7 +168,10 @@ class CollectorPipeline:
         return self._static_assets
 
 
-def write_jsonl(candidates: list[Candidate], output_path: str | Path) -> None:
+def write_jsonl(
+    candidates: list[Candidate] | list[AnalysisCandidate],
+    output_path: str | Path,
+) -> None:
     path = Path(output_path)
     with path.open("w", encoding="utf-8", newline="\n") as output_file:
         for candidate in candidates:
@@ -202,7 +206,8 @@ def write_run_summary(
             [
                 f"## {company.name} (`{company.company_id}`)",
                 "",
-                f"- 결과: `{company.company_id}.jsonl`",
+                f"- 원본: `{company.company_id}_raw.jsonl`",
+                f"- 분석 후보: `{company.company_id}_candidates.jsonl`",
                 f"- 공식 도메인: {', '.join(company.allowed_domains)}",
                 "- 수집 출처: CT, 공개 DNS, Common Crawl, Wayback Machine, "
                 "공식 저장소",
@@ -212,6 +217,9 @@ def write_run_summary(
             lines.extend(
                 [
                     f"- 후보 수: {company_details['candidate_count']}",
+                    f"- 정규화 그룹 수: {company_details['group_count']}",
+                    f"- 최종 분석 후보 수: {company_details['analysis_count']}",
+                    f"- 낮은 우선순위 제외 수: {company_details['low_count']}",
                     "- 공개 색인 요청 수: "
                     f"{company_details['index_request_count']}",
                     "",

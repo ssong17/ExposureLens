@@ -4,6 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from exposure_lens.candidate_filter import (
+    build_analysis_candidates,
+    canonical_url_key,
+    classify_priority,
+)
 from exposure_lens.config import (
     AppConfig,
     CollectorConfig,
@@ -256,6 +261,9 @@ class OutputTests(unittest.TestCase):
                 {
                     "acme": {
                         "candidate_count": 3,
+                        "group_count": 2,
+                        "analysis_count": 1,
+                        "low_count": 1,
                         "index_request_count": 2,
                         "search_queries": ("site:acme.test api",),
                         "errors": (),
@@ -265,9 +273,10 @@ class OutputTests(unittest.TestCase):
             content = summary_path.read_text(encoding="utf-8")
 
         self.assertIn("Acme (`acme`)", content)
-        self.assertIn("acme.jsonl", content)
         self.assertIn("트랙: `DIRECT`", content)
         self.assertIn("site:acme.test api", content)
+        self.assertIn("acme_raw.jsonl", content)
+        self.assertIn("acme_candidates.jsonl", content)
 
     def test_passive_collector_keeps_only_official_domain_urls(self) -> None:
         company = CompanyConfig(
@@ -326,6 +335,62 @@ class OutputTests(unittest.TestCase):
 
         self.assertEqual(candidates[0].target_url, "https://acme.test/docs?version=1")
         self.assertEqual(candidates[0].discovery_method, "official_domain_config")
+
+
+class CandidateFilterTests(unittest.TestCase):
+    def test_canonical_key_merges_scheme_www_and_query_variants(self) -> None:
+        urls = (
+            "http://www.example.com/news/?id=1",
+            "https://example.com/news?id=2",
+        )
+        self.assertEqual(
+            {canonical_url_key(url) for url in urls},
+            {"example.com/news"},
+        )
+
+    def test_priority_classification(self) -> None:
+        self.assertEqual(classify_priority("https://api.example.com/")[0], "high")
+        self.assertEqual(
+            classify_priority("https://news.example.com/article/1")[0],
+            "low",
+        )
+        self.assertEqual(classify_priority("https://example.com/about")[0], "medium")
+
+    def test_analysis_candidates_preserve_raw_variants(self) -> None:
+        company = CompanyConfig(
+            company_id="acme",
+            company_code="ACME",
+            groups=("pilot",),
+            enabled=True,
+            name="Acme",
+            indicator="Acme domain",
+            allowed_domains=("acme.test",),
+            fetch_domains=("acme.test",),
+            seed_urls=("https://acme.test/",),
+            ownership_evidence_urls=("https://acme.test/about",),
+            security_contact="security@acme.test",
+        )
+        app = AppConfig(ConfigTests().make_collector(), (company,))
+        collector = CollectorPipeline(app, company)
+        collector._add_candidate(
+            "https://acme.test/",
+            "http://www.api.acme.test/users?id=1",
+            "index",
+            "unknown",
+        )
+        collector._add_candidate(
+            "https://acme.test/",
+            "https://api.acme.test/users?id=2",
+            "index",
+            "unknown",
+        )
+
+        candidates, counts = build_analysis_candidates(collector._candidates)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].variant_count, 2)
+        self.assertEqual(candidates[0].priority, "high")
+        self.assertEqual(counts["high"], 1)
 
 
 if __name__ == "__main__":
