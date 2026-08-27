@@ -19,7 +19,7 @@ from exposure_lens.pipeline import (
     CollectorPipeline,
     write_run_summary,
 )
-from exposure_lens.passive import PassiveCollector
+from exposure_lens.direct_collector import DirectAssetCollector
 from exposure_lens.urltools import (
     content_hint,
     host_allowed,
@@ -250,12 +250,24 @@ class OutputTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             summary_path = Path(temp_dir) / "summary.md"
-            write_run_summary((company,), summary_path)
+            write_run_summary(
+                (company,),
+                summary_path,
+                {
+                    "acme": {
+                        "candidate_count": 3,
+                        "index_request_count": 2,
+                        "search_queries": ("site:acme.test api",),
+                        "errors": (),
+                    }
+                },
+            )
             content = summary_path.read_text(encoding="utf-8")
 
         self.assertIn("Acme (`acme`)", content)
         self.assertIn("acme.jsonl", content)
-        self.assertIn("acme_site_queries.md", content)
+        self.assertIn("트랙: `DIRECT`", content)
+        self.assertIn("site:acme.test api", content)
 
     def test_passive_collector_keeps_only_official_domain_urls(self) -> None:
         company = CompanyConfig(
@@ -272,7 +284,7 @@ class OutputTests(unittest.TestCase):
             security_contact="security@acme.test",
         )
         app = AppConfig(ConfigTests().make_collector(), (company,))
-        collector = PassiveCollector(app, company, fetch_json=lambda _: [])
+        collector = DirectAssetCollector(app, company, fetch_json=lambda _: [])
 
         collector._add_candidate(
             "https://index.test/",
@@ -286,6 +298,11 @@ class OutputTests(unittest.TestCase):
         )
 
         self.assertEqual(len(collector._candidates), 1)
+        self.assertEqual(collector._candidates[0].track, "DIRECT")
+        self.assertRegex(
+            collector._candidates[0].candidate_id,
+            r"^DIR_ACME_\d{8}_000001$",
+        )
         self.assertIn("key=visible", collector._candidates[0].target_url)
 
     def test_passive_collection_includes_configured_seed(self) -> None:
@@ -303,7 +320,7 @@ class OutputTests(unittest.TestCase):
             security_contact="security@acme.test",
         )
         app = AppConfig(ConfigTests().make_collector(), (company,))
-        collector = PassiveCollector(app, company, fetch_json=lambda _: [])
+        collector = DirectAssetCollector(app, company, fetch_json=lambda _: [])
 
         candidates = collector.collect()
 

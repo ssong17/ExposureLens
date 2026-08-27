@@ -184,13 +184,46 @@ def write_jsonl(candidates: list[Candidate], output_path: str | Path) -> None:
 def write_run_summary(
     companies: tuple[CompanyConfig, ...],
     output_path: str | Path,
+    run_details: dict[str, dict[str, object]] | None = None,
 ) -> None:
     path = Path(output_path)
-    lines = ["# 수집 대상 기업", ""]
-    lines.extend(
-        f"- {company.name} (`{company.company_id}`): "
-        f"`{company.company_id}.jsonl`, "
-        f"`{company.company_id}_site_queries.md`"
-        for company in companies
-    )
+    details = run_details or {}
+    lines = [
+        "# DIRECT 자산 수집 요약",
+        "",
+        "- 트랙: `DIRECT`",
+        "- 수집 방식: 제3자 공개 색인을 이용한 비직접 수집",
+        "- 대상 기업 서버 직접 요청: 없음",
+        "",
+    ]
+    for company in companies:
+        company_details = details.get(company.company_id, {})
+        lines.extend(
+            [
+                f"## {company.name} (`{company.company_id}`)",
+                "",
+                f"- 결과: `{company.company_id}.jsonl`",
+                f"- 공식 도메인: {', '.join(company.allowed_domains)}",
+                "- 수집 출처: CT, 공개 DNS, Common Crawl, Wayback Machine, "
+                "공식 저장소",
+            ]
+        )
+        if company_details:
+            lines.extend(
+                [
+                    f"- 후보 수: {company_details['candidate_count']}",
+                    "- 공개 색인 요청 수: "
+                    f"{company_details['index_request_count']}",
+                    "",
+                    "### site: 검색 쿼리",
+                    "",
+                ]
+            )
+            queries = company_details.get("search_queries", ())
+            lines.extend(f"- `{query}`" for query in queries)
+            errors = company_details.get("errors", ())
+            if errors:
+                lines.extend(["", "### 경고", ""])
+                lines.extend(f"- {error}" for error in errors)
+        lines.append("")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

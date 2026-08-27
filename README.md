@@ -1,23 +1,25 @@
-# 기업 공식 공개 자산 URL 수집기 (MVP)
+# ExposureLens — 기업 직접 노출 자산 URL 수집기
 
-검증된 기업 공식 도메인에서 `robots.txt`, `sitemap.xml`, 공개 HTML의 링크를 제한된 깊이로 수집하고 공통 후보 형식의 JSONL로 저장하는 CLI 도구입니다.
+기업이 직접 공개한 자산의 URL 후보를 제3자 공개 색인에서 수집하여 JSONL로
+저장하는 CLI 도구입니다. 모든 후보는 `DIRECT` 트랙과 `DIR_` ID를 사용합니다.
 
-이 버전은 **URL 후보 수집만 수행**합니다. 개인정보·비밀키 탐지, 로그인, 폼 제출, 경로 추측, API 키 검증, 스토리지 목록 조회 기능은 포함하지 않습니다.
+이 버전은 **URL 후보 수집만 수행**합니다. 로그인, 경로 추측, API 호출, 키 검증,
+DB 접속 및 스토리지 목록 조회는 수행하지 않습니다.
 
 ## 프로젝트 구조
 
 ```text
 src/exposure_lens/
-├── __init__.py      # Python 패키지 정의와 버전
-├── __main__.py      # `python -m exposure_lens` 실행 진입점
-├── cli.py           # CLI 명령과 옵션 처리
-├── config.py        # TOML 설정 로드와 유효성 검사
-├── discovery.py     # HTML, sitemap, robots.txt 링크 추출
-├── http_client.py   # 요청 제한과 보안 검사가 적용된 HTTP 클라이언트
-├── models.py        # 후보 데이터 모델
-├── passive.py       # 공개 색인 기반 수동적 URL 후보 수집
-├── pipeline.py      # URL 수집 흐름과 JSONL 저장
-└── urltools.py      # URL 정규화, 도메인 검사와 유형 판별
+├── __init__.py            # Python 패키지 정의와 버전
+├── __main__.py            # `python -m exposure_lens` 실행 진입점
+├── cli.py                 # CLI 명령과 옵션 처리
+├── config.py              # TOML 설정 로드와 유효성 검사
+├── direct_collector.py    # DIRECT 트랙 공개 색인 수집기
+├── discovery.py           # HTML, sitemap, robots.txt 파서
+├── http_client.py         # 제한적 직접 수집용 HTTP 클라이언트
+├── models.py              # 공통 후보 데이터 모델
+├── pipeline.py            # 제한적 직접 수집과 결과 저장
+└── urltools.py            # URL 정규화, 도메인 검사와 유형 판별
 ```
 
 - `collector_tests/test_collector.py`: 설정, URL 수집과 출력 기능 테스트
@@ -30,13 +32,11 @@ src/exposure_lens/
 
 - `--company`, `--group`, `--all-enabled` 중 하나로 실행 범위를 명시
 - 설정에 `enabled = true`인 기업만 실행
-- 검증된 `allowed_domains`만 실제 요청
-- 외부 CDN·스토리지 링크는 후보로만 기록하며 `fetch_domains`에 없으면 요청하지 않음
-- `GET` 요청만 사용
-- 탐색 깊이, 최대 요청 수, 응답 크기, 요청 간격, 재시도 횟수 제한
-- 사설 IP, localhost, URL 사용자정보, 비 HTTP(S) 주소 차단
-- 쿼리 문자열이 포함된 URL은 기본적으로 실제 요청하지 않고 후보로만 기록
-- `robots.txt`의 접근 제한 적용
+- 검증된 `allowed_domains`에 속하는 URL만 후보로 저장
+- 대상 기업 서버가 아닌 CT, 공개 DNS, Common Crawl, Wayback만 조회
+- `site:` 검색은 자동 스크래핑하지 않고 검색 쿼리만 생성
+- 공개 색인 요청 수, 응답 크기, 요청 간격과 재시도 횟수 제한
+- 발견한 API, 자격증명, DB 및 스토리지에 직접 접근하지 않음
 
 ## 시작하기
 
@@ -47,7 +47,8 @@ python -m pip install -e .
 cp config.example.toml config.toml
 ```
 
-`config.toml`에서 예시 기업을 실제 조사 기업으로 교체합니다. 도메인과 소유 근거를 직접 검증한 후에만 `enabled = true`로 바꿉니다.
+`config.toml`에서 예시 기업을 실제 조사 기업으로 교체합니다. 도메인과 소유 근거를
+직접 검증한 후에만 `enabled = true`로 바꿉니다.
 
 설정 검사:
 
@@ -79,41 +80,54 @@ exposure-lens collect \
 
 결과는 `output/YYYYMMDD/`에 저장됩니다. 기업별 JSONL에는 CT, 공개 DNS,
 Common Crawl, Wayback Machine 및 공식 저장소에서 발견한 URL 후보가 기록됩니다.
-`_site_queries.md`에는 수동 또는 허용된 검색 API에서 사용할 `site:` 쿼리가,
-`summary.md`에는 실행 대상 기업 목록이 기록됩니다. 출력 상위 경로는 `--output`으로
-변경할 수 있으며, 모든 활성 기업은 `--all-enabled`로 선택할 수 있습니다.
+`summary.md`에는 실행 대상, 수집 방식, 출처, `site:` 검색 쿼리와 오류가 함께
+기록됩니다. 출력 상위 경로는 `--output`으로 변경할 수 있으며, 모든 활성 기업은
+`--all-enabled`로 선택할 수 있습니다.
 
 수집기는 대상 기업 웹사이트에 직접 요청하지 않습니다. URL은 쿼리 문자열을 마스킹하지
 않고 저장하므로 결과 파일에 비밀정보가 포함될 수 있습니다. 결과를 외부에 공유하거나
 버전 관리에 포함하지 마세요.
 
+`PASSIVE`는 수집 방식이지 트랙 이름이 아닙니다. 공개 색인에서 발견했더라도 기업이
+직접 공개한 자산이면 `track`은 `DIRECT`이며 후보 ID는 `DIR_`로 시작합니다.
+
 ## 설정 원칙
 
 - `allowed_domains`: 해당 기업의 소유 관계가 검증된 공식 도메인
-- `fetch_domains`: 실제 HTTP 요청을 허용할 도메인. 보통 `allowed_domains`와 동일하게 시작
-- `seed_urls`: 수집 시작점인 공식 홈페이지
+- `fetch_domains`: 향후 승인된 직접 수집에서만 사용할 요청 허용 도메인
+- `seed_urls`: 공식 도메인에서 확인된 기본 URL 후보
 - `ownership_evidence_urls`: 도메인 소유 관계를 사람이 검증한 근거
+- `official_repositories`: 기업 소유가 확인된 GitHub·GitLab 저장소
 - `security_contact`: 발견 시 연락할 공식 보안 채널
 - `indicator`: 후보 레코드에 기록할 기업 식별자
 - `company_code`: 후보 ID에 사용할 2~12자의 영문 대문자·숫자 코드
 - `groups`: 여러 기업을 순차 실행할 때 사용할 그룹 이름
 
-외부 CDN이나 스토리지를 실제로 요청해야 한다면 소유·연결 관계를 먼저 검토하고 해당 호스트를 `fetch_domains`에 명시적으로 추가합니다. 단순히 공식 페이지에서 링크되었다는 이유만으로 외부 호스트 전체를 허용하지 마세요.
+외부 CDN이나 저장소는 기업과의 소유·연결 관계가 검증된 경우에만 공식 자산으로
+분류합니다.
 
 ## 출력 예시
 
 ```json
-{"candidate_id":"DIR_EXAMPLE_20260826_000001","track":"DIRECT","company_name":"예시기업","source_platform":"official_web","source_url":"https://example.com/sitemap.xml","target_platform":"company_web","target_url":"https://example.com/files/guide.pdf","discovery_method":"sitemap","matched_indicator":"예시기업 공식 도메인","discovered_at":"2026-08-26T15:30:00+09:00","content_hint":"pdf"}
+{"candidate_id":"DIR_EXAMPLE_20260827_000001","track":"DIRECT","company_name":"예시기업","source_platform":"common_crawl","source_url":"https://index.commoncrawl.org/...","target_platform":"company_web","target_url":"https://example.com/openapi.json","discovery_method":"common_crawl","matched_indicator":"예시기업 공식 도메인","discovered_at":"2026-08-27T15:30:00+09:00","content_hint":"json"}
 ```
 
-`source_url`은 대상을 발견한 페이지이고 `target_url`은 실제 후보입니다. 동일한 콘텐츠가 여러 페이지에서 발견되면 콘텐츠 중복 제거 전까지 발견 관계가 각각 남을 수 있습니다.
+`source_url`은 후보를 제공한 공개 색인이고 `target_url`은 기업 자산 후보입니다.
+실제 노출 여부나 현재 접근 가능 여부는 검증하지 않습니다.
 
 ## 현재 MVP의 한계
 
-- JavaScript 안에 문자열로 들어 있는 URL은 아직 추출하지 않음
-- 콘텐츠 해시 중복 제거는 실제로 가져온 응답에만 적용
-- 동적 렌더링 페이지는 처리하지 않음
+- 검색엔진 결과를 자동으로 가져오지 않고 `site:` 쿼리만 생성
+- 공개 색인에 포함되지 않은 최신·비색인 URL은 발견할 수 없음
+- HTTP/HTTPS, `www`, 쿼리 변형에 대한 의미 기반 중복 제거는 아직 없음
+- Wayback 후보는 과거 기록이며 현재 자산임을 보장하지 않음
 - 자산 소유 관계는 자동 판정하지 않음
 - 민감성 및 공개 의도는 자동 판정하지 않음
 
-다음 단계에서는 플랫폼별 어댑터를 추가하되 URL 수집과 민감정보 탐지 모듈을 계속 분리하는 것이 좋습니다.
+## 트랙 확장
+
+- `DIRECT`: 기업이 직접 공개한 공식 도메인·저장소 자산
+- 제3자 트랙: 팀원이 별도 수집기로 구현할 재배포·유통 자산
+
+두 트랙은 설정과 공통 후보 모델을 공유하되 수집기와 출력은 분리합니다. URL 수집과
+후속 민감정보 분석도 별도 단계로 유지합니다.

@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import load_config
-from .passive import PassiveCollector
+from .direct_collector import DirectAssetCollector
 from .pipeline import write_jsonl, write_run_summary
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.dry_run:
             summaries = [
-                PassiveCollector(app, company).dry_run_summary()
+                DirectAssetCollector(app, company).dry_run_summary()
                 for company in companies
             ]
             print(json.dumps(summaries, ensure_ascii=False, indent=2))
@@ -61,18 +61,18 @@ def main(argv: list[str] | None = None) -> int:
         run_date = datetime.now().astimezone().strftime("%Y%m%d")
         output = Path(args.output) / run_date
         output.mkdir(parents=True, exist_ok=True)
+        run_details: dict[str, dict[str, object]] = {}
         for company in companies:
-            collector = PassiveCollector(app, company)
+            collector = DirectAssetCollector(app, company)
             candidates = collector.collect()
             destination = output / f"{company.company_id}.jsonl"
             write_jsonl(candidates, destination)
-            queries_destination = output / f"{company.company_id}_site_queries.md"
-            queries_destination.write_text(
-                "# site: 검색 쿼리\n\n"
-                + "\n".join(f"- `{query}`" for query in collector.search_queries)
-                + "\n",
-                encoding="utf-8",
-            )
+            run_details[company.company_id] = {
+                "candidate_count": len(candidates),
+                "index_request_count": collector.request_count,
+                "search_queries": collector.search_queries,
+                "errors": collector.errors,
+            }
             print(
                 f"수집 완료: {company.name}, 후보 {len(candidates)}개, "
                 f"공개 색인 요청 {collector.request_count}회, 출력 {destination}"
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
             for error in collector.errors:
                 print(f"경고: {error}", file=sys.stderr)
         summary_path = output / "summary.md"
-        write_run_summary(companies, summary_path)
+        write_run_summary(companies, summary_path, run_details)
         print(f"대상 기업 요약: {summary_path}")
         return 0
     except (OSError, ValueError, RuntimeError) as exc:

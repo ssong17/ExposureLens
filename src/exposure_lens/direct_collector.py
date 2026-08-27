@@ -28,8 +28,8 @@ SEARCH_TERMS = (
 )
 
 
-class PassiveCollector:
-    """Collect URL candidates from third-party public indexes only."""
+class DirectAssetCollector:
+    """Collect company-owned URL candidates from public indexes."""
 
     def __init__(
         self,
@@ -222,10 +222,10 @@ class PassiveCollector:
         self._candidates.append(
             Candidate(
                 candidate_id=(
-                    f"PAS_{self.company.company_code}_{self._run_date}_"
+                    f"DIR_{self.company.company_code}_{self._run_date}_"
                     f"{len(self._candidates) + 1:06d}"
                 ),
-                track="PASSIVE",
+                track="DIRECT",
                 company_name=self.company.name,
                 source_platform=method,
                 source_url=source_url,

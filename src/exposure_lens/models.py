@@ -8,7 +8,7 @@ from typing import Literal
 @dataclass(frozen=True)
 class Candidate:
     candidate_id: str
-    track: Literal["DIRECT", "PASSIVE"]
+    track: Literal["DIRECT"]
     company_name: str
     source_platform: str
     source_url: str
