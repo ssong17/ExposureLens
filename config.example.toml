@@ -1,0 +1,24 @@
+[collector]
+user_agent = "PublicAssetResearch/0.1 (+replace-with-your-contact@example.org)"
+request_interval_seconds = 3.0
+timeout_seconds = 10.0
+max_retries = 1
+max_depth = 1
+max_requests = 50
+max_response_bytes = 5000000
+respect_robots = true
+fetch_query_urls = false
+
+[[companies]]
+company_id = "example"
+company_code = "EXAMPLE"
+groups = ["pilot"]
+enabled = false
+name = "예시기업"
+indicator = "예시기업 공식 도메인"
+allowed_domains = ["example.com"]
+fetch_domains = ["example.com"]
+seed_urls = ["https://example.com/"]
+ownership_evidence_urls = ["https://example.com/about"]
+security_contact = "security@example.com"
+official_repositories = ["https://github.com/example"]
