@@ -1,21 +1,23 @@
 from __future__ import annotations
 
-from exposure_lens.apex import discover_apex
-from exposure_lens.config import OrgConfig
-from exposure_lens.tldclass import registrable_apex, tld_class
-from exposure_lens.sources import crtsh
+from exposure_lens.apex.discovery import discover_apex
+from exposure_lens.apex.tldclass import registrable_apex, tld_class
+from exposure_lens.collect.collector import _is_endpoint, select_target_apexes
+from exposure_lens.core.config import OrgConfig
+from exposure_lens.core.models import ApexCandidate
+from exposure_lens.sources import crtsh, cymru
 
 
 class StubHttp:
-    """crt.sh 응답을 흉내 내는 네트워크 없는 스텁."""
+    """Network-free stub returning canned JSON for any URL."""
 
-    def __init__(self, records: list[dict]) -> None:
-        self._records = records
+    def __init__(self, payload) -> None:
+        self._payload = payload
         self.request_count = 0
 
     def get_json(self, url: str):
         self.request_count += 1
-        return self._records
+        return self._payload
 
 
 def _cert(common_name: str) -> dict:
@@ -52,10 +54,8 @@ def test_discover_apex_ranks_and_scores():
     candidates, errors = discover_apex(StubHttp(records), org)
 
     assert not errors
-    top = candidates[0]
-    assert top.apex == "snu.ac.kr"
-    assert top.confidence == "high"  # seed 일치
-    # 형제 학교는 medium 이하로 격리된다.
+    assert candidates[0].apex == "snu.ac.kr"
+    assert candidates[0].confidence == "high"
     sibling = next(c for c in candidates if c.apex == "other.ac.kr")
     assert sibling.confidence in {"medium", "low"}
 
@@ -67,3 +67,26 @@ def test_discover_apex_drops_cdn_noise():
     apexes = {c.apex for c in candidates}
     assert "cloudfront.net" not in apexes
     assert "x.com" in apexes
+
+
+def test_select_target_apexes_keeps_high_medium_within_limit():
+    cands = [
+        ApexCandidate("o", "company", "a.com", "high", 100, (), "crt.sh", ""),
+        ApexCandidate("o", "company", "b.com", "medium", 50, (), "crt.sh", ""),
+        ApexCandidate("o", "company", "c.com", "low", 10, (), "crt.sh", ""),
+    ]
+    picked = select_target_apexes(cands, limit=5)
+    assert [c.apex for c in picked] == ["a.com", "b.com"]
+    assert select_target_apexes(cands, limit=1)[0].apex == "a.com"
+
+
+def test_is_endpoint_skips_static_media():
+    assert _is_endpoint("https://x.com/api/config.json")
+    assert _is_endpoint("https://x.com/app.js")
+    assert not _is_endpoint("https://x.com/logo.png")
+
+
+def test_cymru_asn_parsing():
+    payload = {"Answer": [{"data": '"23576 | 1.208.0.0/13 | KR | apnic | 2011-02-01"'}]}
+    assert cymru.asn_of(StubHttp(payload), "1.2.3.4") == "AS23576"
+    assert cymru.asn_of(StubHttp(payload), "not-an-ip") == ""

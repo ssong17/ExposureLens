@@ -10,7 +10,7 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-from ..net import Http
+from ..core.net import Http
 
 _HOSTISH = re.compile(
     r"^[a-z0-9_](?:[a-z0-9_-]*[a-z0-9])?(?:\.[a-z0-9_](?:[a-z0-9_-]*[a-z0-9])?)+$"

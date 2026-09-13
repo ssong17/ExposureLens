@@ -18,8 +18,11 @@ class CollectorConfig:
     request_interval_seconds: float = 2.0
     timeout_seconds: float = 30.0
     max_retries: int = 1
-    max_requests: int = 300
+    max_requests: int = 1000
     max_apex_per_org: int = 25
+    max_endpoints_per_org: int = 3000
+    resolve_timeout: float = 3.0
+    resolve_workers: int = 20
     max_response_bytes: int = 30_000_000
 
 
@@ -79,6 +82,11 @@ def load_config(path: str | Path) -> AppConfig:
         max_apex_per_org=int(
             c.get("max_apex_per_org", CollectorConfig.max_apex_per_org)
         ),
+        max_endpoints_per_org=int(
+            c.get("max_endpoints_per_org", CollectorConfig.max_endpoints_per_org)
+        ),
+        resolve_timeout=float(c.get("resolve_timeout", CollectorConfig.resolve_timeout)),
+        resolve_workers=int(c.get("resolve_workers", CollectorConfig.resolve_workers)),
     )
 
     orgs = tuple(
@@ -109,10 +117,14 @@ def validate_config(app: AppConfig) -> None:
         raise ValueError("timeout_seconds와 max_response_bytes는 0보다 커야 합니다.")
     if not 0 <= col.max_retries <= 3:
         raise ValueError("max_retries는 0~3 범위여야 합니다.")
-    if not 1 <= col.max_requests <= 2000:
-        raise ValueError("max_requests는 1~2000 범위여야 합니다.")
+    if not 1 <= col.max_requests <= 5000:
+        raise ValueError("max_requests는 1~5000 범위여야 합니다.")
     if not 1 <= col.max_apex_per_org <= 200:
         raise ValueError("max_apex_per_org는 1~200 범위여야 합니다.")
+    if col.max_endpoints_per_org < 0:
+        raise ValueError("max_endpoints_per_org는 0 이상이어야 합니다.")
+    if col.resolve_timeout <= 0 or col.resolve_workers < 1:
+        raise ValueError("resolve_timeout>0, resolve_workers>=1 이어야 합니다.")
 
     seen: set[str] = set()
     for org in app.orgs:

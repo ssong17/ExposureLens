@@ -4,12 +4,12 @@ import argparse
 import sys
 from pathlib import Path
 
-from .apex import discover_apex
-from .collector import collect_org
-from .config import AppConfig, OrgConfig, load_config
-from .models import ApexCandidate, Asset, run_date
-from .net import Http
-from .output import write_jsonl, write_summary
+from .apex.discovery import discover_apex
+from .collect.collector import collect_org
+from .core.config import AppConfig, OrgConfig, load_config
+from .core.models import ApexCandidate, Asset, run_date
+from .core.net import Http
+from .report.output import write_jsonl, write_summary
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,6 +33,13 @@ def build_parser() -> argparse.ArgumentParser:
         scope.add_argument("--group", help="all enabled orgs in this group")
         scope.add_argument("--all-enabled", action="store_true", help="all enabled orgs")
         p.add_argument("--output", "-o", default="output", help="output root directory")
+        if name == "collect":
+            p.add_argument(
+                "--no-resolve", action="store_true", help="skip IP/ASN resolution"
+            )
+            p.add_argument(
+                "--no-endpoints", action="store_true", help="skip Wayback endpoints"
+            )
     return parser
 
 
@@ -99,18 +106,28 @@ def _run_collect(app: AppConfig, args: argparse.Namespace) -> int:
     problems: list[str] = []
 
     for org in _select(app, args):
-        assets, org_problems = collect_org(http, org, app.collector)
+        assets, org_problems = collect_org(
+            http,
+            org,
+            app.collector,
+            resolve=not args.no_resolve,
+            endpoints=not args.no_endpoints,
+        )
         all_assets.extend(assets)
         problems.extend(org_problems)
 
-        apex_count = len({a.apex for a in assets})
-        sub_count = sum(1 for a in assets if a.asset_type == "subdomain")
+        sub_count = sum(1 for a in assets if a.asset_type in ("apex", "subdomain"))
+        ep_count = sum(1 for a in assets if a.asset_type == "endpoint")
+        ip_count = len({a.resolved_ip for a in assets if a.resolved_ip})
         print(
             f"\n{org.name} ({org.org_id}) - {len(assets)} assets "
-            f"({apex_count} apex, {sub_count} subdomain)"
+            f"({sub_count} hosts, {ep_count} endpoints, {ip_count} IPs)"
         )
         for a in assets[:20]:
-            print(f"  {a.apex_confidence:<6} {a.host}")
+            if a.asset_type == "endpoint":
+                print(f"  {a.apex_confidence:<6} endpoint {a.url}")
+            else:
+                print(f"  {a.apex_confidence:<6} {a.host} {a.resolved_ip} {a.asn}")
         if len(assets) > 20:
             print(f"  ... and {len(assets) - 20} more")
 

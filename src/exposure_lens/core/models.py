@@ -36,6 +36,7 @@ class Asset:
     host: str
     source: str
     discovered_at: str
+    url: str = ""
     resolved_ip: str = ""
     asn: str = ""
     in_scope: bool = True
