@@ -126,7 +126,7 @@ def collect_org(
         )
         unique_ips = {ip for ip in ip_map.values() if ip}
         say(f"[{org.org_id}] ASN lookup for {len(unique_ips)} IPs...")
-        asn_map = cymru.annotate(http, unique_ips)
+        asn_map = cymru.annotate(unique_ips)
 
     date = run_date()
     prefix = _prefix(org.org_id)

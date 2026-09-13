@@ -86,7 +86,11 @@ def test_is_endpoint_skips_static_media():
     assert not _is_endpoint("https://x.com/logo.png")
 
 
-def test_cymru_asn_parsing():
-    payload = {"Answer": [{"data": '"23576 | 1.208.0.0/13 | KR | apnic | 2011-02-01"'}]}
-    assert cymru.asn_of(StubHttp(payload), "1.2.3.4") == "AS23576"
-    assert cymru.asn_of(StubHttp(payload), "not-an-ip") == ""
+def test_cymru_parse_bulk():
+    text = (
+        "AS      | IP            | BGP Prefix    | CC | Registry | Allocated | AS Name\n"
+        "9488    | 147.46.10.129 | 147.46.0.0/16 | KR | apnic    | 1994-01-01 | SNU\n"
+        "NA      | 10.0.0.1      | NA            | NA | other    | NA        | NA\n"
+    )
+    result = cymru.parse_bulk(text)
+    assert result == {"147.46.10.129": "AS9488"}  # header and NA rows skipped
