@@ -7,6 +7,7 @@ Resolution runs off the request budget; ASN enrichment covers unique IPs only.
 from __future__ import annotations
 
 import re
+from typing import Callable
 from urllib.parse import urlsplit
 
 from ..apex.discovery import discover_apex
@@ -56,8 +57,11 @@ def collect_org(
     *,
     resolve: bool = True,
     endpoints: bool = True,
+    log: Callable[[str], None] | None = None,
 ) -> tuple[list[Asset], list[str]]:
     """Return (assets, problems) for one organization."""
+    say = log or (lambda _: None)
+    say(f"[{org.org_id}] discovering apex...")
     candidates, errors = discover_apex(http, org)
     problems = [f"[{org.org_id}] {e}" for e in errors]
     if not candidates:
@@ -65,6 +69,7 @@ def collect_org(
         return [], problems
 
     targets = select_target_apexes(candidates, collector.max_apex_per_org)
+    say(f"[{org.org_id}] apex: {len(candidates)} candidates, {len(targets)} to collect")
     eligible = sum(1 for c in candidates if c.confidence in TARGET_CONFIDENCES)
     if eligible > len(targets):
         problems.append(
@@ -76,7 +81,8 @@ def collect_org(
     endpoint_rows: list[tuple[str, str, str, str]] = []  # (apex, conf, url, host)
     endpoint_urls: set[str] = set()
 
-    for cand in targets:
+    for i, cand in enumerate(targets, 1):
+        say(f"[{org.org_id}] ({i}/{len(targets)}) {cand.apex} crt.sh/wayback...")
         try:
             for host in crtsh.domain_search(http, cand.apex):
                 host_apex.setdefault(host, (cand.apex, cand.confidence))
@@ -109,18 +115,18 @@ def collect_org(
                 endpoint_urls.add(url)
                 endpoint_rows.append((cand.apex, cand.confidence, url, host))
 
-    ip_map = (
-        resolve_hosts(
+    ip_map = {}
+    asn_map = {}
+    if resolve:
+        say(f"[{org.org_id}] resolving {len(host_apex)} hosts...")
+        ip_map = resolve_hosts(
             list(host_apex),
             timeout=collector.resolve_timeout,
             workers=collector.resolve_workers,
         )
-        if resolve
-        else {}
-    )
-    asn_map = (
-        cymru.annotate(http, {ip for ip in ip_map.values() if ip}) if resolve else {}
-    )
+        unique_ips = {ip for ip in ip_map.values() if ip}
+        say(f"[{org.org_id}] ASN lookup for {len(unique_ips)} IPs...")
+        asn_map = cymru.annotate(http, unique_ips)
 
     date = run_date()
     prefix = _prefix(org.org_id)
@@ -153,4 +159,5 @@ def collect_org(
 
     if not assets:
         problems.append(f"[{org.org_id}] no assets collected")
+    say(f"[{org.org_id}] done: {len(assets)} assets")
     return assets, problems

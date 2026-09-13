@@ -40,6 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument(
                 "--no-endpoints", action="store_true", help="skip Wayback endpoints"
             )
+            p.add_argument(
+                "--quiet", "-q", action="store_true", help="suppress progress logs"
+            )
     return parser
 
 
@@ -104,6 +107,7 @@ def _run_collect(app: AppConfig, args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     all_assets: list[Asset] = []
     problems: list[str] = []
+    log = None if args.quiet else lambda m: print(m, file=sys.stderr, flush=True)
 
     for org in _select(app, args):
         assets, org_problems = collect_org(
@@ -112,6 +116,7 @@ def _run_collect(app: AppConfig, args: argparse.Namespace) -> int:
             app.collector,
             resolve=not args.no_resolve,
             endpoints=not args.no_endpoints,
+            log=log,
         )
         all_assets.extend(assets)
         problems.extend(org_problems)
