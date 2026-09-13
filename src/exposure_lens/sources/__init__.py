@@ -1,0 +1,1 @@
+"""Public-index source adapters."""
