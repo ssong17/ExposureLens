@@ -1,140 +1,192 @@
-# ExposureLens — 기업 직접 노출 자산 URL 수집기
+# ExposureLens
 
-기업이 직접 공개한 자산의 URL 후보를 제3자 공개 색인에서 수집하여 JSONL로 저장하는 CLI 도구이다. 모든 후보는 `DIRECT` 트랙과 `DIR_` ID를 사용한다.
+기관 목록만 주면 공개 색인에서 그 기관의 외부 노출 자산을 수집하고, 수집된 자산에서 민감한 노출 지점을 찾아내는 CLI 도구다.
 
-이 버전은 **URL 후보 수집만 수행**한다. 로그인, 경로 추측, API 호출, 키 검증, DB 접속 및 스토리지 목록 조회는 수행하지 않는다.
+대상 서버에 직접 요청하지 않고 제3자 공개 색인(인증서 투명성 로그, 웹 아카이브, 공개 DNS)만 조회하는 **비파괴(passive)** 방식으로 동작한다. 외부 의존성 없이 Python 표준 라이브러리만 사용한다.
+
+## 특징
+
+- **기관 목록 기반 자동화**: 도메인을 일일이 나열할 필요 없이, 기관명만 주면 소유 apex 도메인을 자동으로 찾는다.
+- **비파괴 수집**: crt.sh, Wayback, Team Cymru 등 공개 색인만 조회한다. 대상 서버에 요청을 보내지 않는다.
+- **소유 신뢰도(confidence) 판정**: 발견한 apex마다 근거와 함께 high/medium/low를 매겨, 엉뚱한 기관의 자산이 섞이는 것을 격리한다.
+- **다중 소스 복원력**: 한 소스가 장애여도(crt.sh는 502가 잦다) Wayback 등 다른 소스로 보완한다.
+- **민감정보 스캐너**: 수집된 자산에서 노출된 Git/CI 호스트, 설정·백업 파일 경로, URL에 유출된 시크릿을 심각도별로 탐지한다. 발견한 시크릿은 마스킹하며 절대 검증하지 않는다.
+- **무의존성**: `pip install` 추가 패키지가 없다. Python 3.11 이상이면 된다.
+
+## 동작 원리
+
+```
+기관 목록(config.toml)
+  │
+  ├─ apex 발견        crt.sh 조직 검색 -> 인증서 수 기준 랭킹 -> confidence 판정
+  │
+  ├─ 자산 수집        high+medium apex 하위에서
+  │     ├─ 서브도메인   crt.sh + Wayback
+  │     ├─ 엔드포인트   Wayback CDX
+  │     ├─ IP           시스템 리졸버
+  │     └─ ASN          Team Cymru 벌크 whois
+  │
+  └─ 노출 스캔        수집된 자산을 규칙으로 검사 -> 심각도별 findings
+```
+
+## 설치
+
+```bash
+git clone <repo>
+cd ExposureLens
+pip install -e .
+```
+
+Conda 환경에서 쓸 경우 환경을 먼저 활성화한 뒤 설치한다.
+
+```bash
+conda create -n exposurelens python=3.12 -y
+conda activate exposurelens
+pip install -e .
+```
+
+설치 후 `exposure-lens` 명령을 쓸 수 있다. 설치 없이 실행하려면 `PYTHONPATH=src python -m exposure_lens ...` 형태로도 된다.
+
+## 사용법
+
+### 1. 설정 준비
+
+`config.example.toml`을 복사해 `config.toml`을 만들고 조사할 기관을 채운다. `config.toml`은 gitignore 대상이다.
+
+```bash
+cp config.example.toml config.toml
+exposure-lens validate -i config.toml
+```
+
+### 2. apex 발견 (선택)
+
+수집 전에 어떤 apex가 어떤 신뢰도로 잡히는지 확인하고 싶을 때 쓴다. 후보를 화면과 `apex.jsonl`로 뽑을 뿐, 설정을 바꾸지 않는다.
+
+```bash
+exposure-lens discover-apex -i config.toml --org snu
+```
+
+### 3. 자산 수집
+
+apex 발견부터 서브도메인·엔드포인트·IP·ASN 수집까지 한 번에 수행한다.
+
+```bash
+exposure-lens collect -i config.toml --org snu          # 기관 하나
+exposure-lens collect -i config.toml --group pilot      # 그룹 단위
+exposure-lens collect -i config.toml --all-enabled      # 활성 기관 전부
+```
+
+진행 상황은 stderr로 실시간 출력되고, 결과는 `assets.jsonl`에 저장된다.
+
+| 옵션 | 설명 |
+| --- | --- |
+| `--no-resolve` | IP/ASN 조회를 건너뛴다 |
+| `--no-endpoints` | Wayback 엔드포인트 수집을 건너뛴다 |
+| `--quiet`, `-q` | 진행 로그를 끈다 |
+
+### 4. 노출 스캔
+
+수집 결과(`assets.jsonl`)를 입력으로 받아 노출 지점을 찾는다.
+
+```bash
+exposure-lens scan -a output/20260914/assets.jsonl
+exposure-lens scan -a output/20260914/assets.jsonl --min-severity high
+```
+
+## 설정
+
+```toml
+[collector]
+user_agent = "PublicAssetResearch/0.2 (+security-research)"
+request_interval_seconds = 2.0   # 요청 간격(초). 무료 색인 레이트리밋 방어
+timeout_seconds = 30.0
+max_retries = 1
+max_requests = 1000              # 한 실행의 총 요청 상한
+max_apex_per_org = 25            # 기관당 수집할 apex 상한
+max_endpoints_per_org = 3000
+
+# 기관 목록: org_id / name / org_type / enabled 만 채우면 된다.
+[[orgs]]
+org_id = "snu"
+name = "Seoul National University"  # crt.sh 조직 검색에 그대로 쓰인다
+org_type = "school"                 # company | gov | school | nonprofit | research | other
+enabled = true
+groups = ["pilot"]                  # (선택) 그룹 단위 실행용
+search_names = ["서울대학교"]         # (선택) 별칭/한글명으로 커버리지 보강
+seed_domains = ["snu.ac.kr"]        # (선택) 아는 도메인. 있으면 confidence high
+```
+
+`name`은 인증서 주체 조직명과 매칭되므로 실제 인증서에 박히는 이름이어야 한다. 애매하면 `search_names`에 영문·한글을 함께 넣는다. `org_type`은 한국 규제 TLD(.go.kr / .ac.kr / .or.kr)를 소유 근거로 활용해 정확도를 높인다.
+
+## 출력
+
+실행마다 `output/YYYYMMDD/` 아래에 결과가 쌓인다. 성공 결과는 JSONL과 stdout에 남기고, `summary.md`에는 문제(실패·중단)만 기록한다.
+
+| 파일 | 생성 명령 | 내용 |
+| --- | --- | --- |
+| `apex.jsonl` | discover-apex | apex 후보 전체(low 포함) |
+| `assets.jsonl` | collect | 수집된 자산(모든 기관 통합, `org_id`로 구분) |
+| `findings.jsonl` | scan | 탐지된 노출 |
+| `summary.md` / `findings_summary.md` | 각 명령 | 문제 또는 조치가 필요한 항목 |
+
+자산 레코드 예시:
+
+```json
+{"record_id":"SNU_20260914_000001","org_id":"snu","apex":"snu.ac.kr",
+ "apex_confidence":"high","asset_type":"subdomain","host":"portal.snu.ac.kr",
+ "source":"crt.sh+wayback","discovered_at":"2026-09-14T01:07:19+09:00",
+ "url":"","resolved_ip":"147.46.10.129","asn":"AS9488","in_scope":true}
+```
+
+탐지 레코드 예시(`asset_ref`로 원본 자산까지 역추적된다):
+
+```json
+{"finding_id":"F_20260914_000001","org_id":"snu","asset_ref":"SNU_20260914_000178",
+ "severity":"high","category":"sensitive-host","rule":"host-vcs",
+ "host":"git.csap.snu.ac.kr","url":"","evidence":"git.csap.snu.ac.kr",
+ "discovered_at":"2026-09-14T01:41:54+09:00"}
+```
+
+## confidence 와 severity
+
+**apex confidence** — 발견한 apex가 정말 그 기관 소유인지에 대한 신뢰도다.
+
+- `high`: seed 일치, 또는 인증서 수 최상위이면서 점유율이 유의미한 apex
+- `medium`: org_type과 TLD 클래스가 일치하고 인증서 수가 임계치 이상
+- `low`: 롱테일·형제 기관 의심 (수집 대상에서 제외)
+
+수집기는 high+medium apex만 수집하고, 능동적인 후속 작업은 high로 좁히는 것을 전제로 설계했다.
+
+**finding severity** — 노출의 위험도다.
+
+- `critical`: 시크릿 파일(.env, 개인키), 유출된 AWS/Slack 키
+- `high`: 노출된 Git/CI 호스트, 설정·백업 파일, URL 내 시크릿
+- `medium`: 비운영(dev/staging/test)·내부 호스트, 관리자 페이지 경로
+- `low`: API 문서/스키마 표면
+
+## 안전 원칙
+
+- 수집·스캔은 전부 비파괴다. 대상 서버에 직접 요청하지 않는다.
+- 포트 스캔, 엔드포인트 프로빙, DNS 브루트포스 같은 능동 행위는 이 도구에 포함하지 않는다. 이런 작업은 대상별 명시적 허가 아래에서만 별도로 다룬다.
+- 발견한 자격증명은 마스킹만 하고 절대 사용·검증하지 않는다.
+- 결과 파일에는 쿼리 문자열 등 민감정보가 포함될 수 있으므로 외부에 공유하거나 버전 관리에 포함하지 않는다.
 
 ## 프로젝트 구조
 
-```text
+```
 src/exposure_lens/
-├── __init__.py            # Python 패키지 정의와 버전
-├── __main__.py            # `python -m exposure_lens` 실행 진입점
-├── cli.py                 # CLI 명령과 옵션 처리
-├── candidate_filter.py    # URL 그룹화와 분석 우선순위 분류
-├── config.py              # TOML 설정 로드와 유효성 검사
-├── direct_collector.py    # DIRECT 트랙 공개 색인 수집기
-├── discovery.py           # HTML, sitemap, robots.txt 파서
-├── http_client.py         # 제한적 직접 수집용 HTTP 클라이언트
-├── models.py              # 공통 후보 데이터 모델
-├── pipeline.py            # 제한적 직접 수집과 결과 저장
-└── urltools.py            # URL 정규화, 도메인 검사와 유형 판별
+├── cli.py               명령 처리
+├── core/                config, models, net(레이트리밋 HTTP)
+├── sources/             crtsh, wayback, cymru
+├── apex/                discovery, tldclass
+├── collect/             collector, resolve
+├── scan/                rules, scanner
+└── report/              output(JSONL, summary)
 ```
 
-- `collector_tests/test_collector.py`: 설정, URL 수집과 출력 기능 테스트
-- `config.example.toml`: 설정 파일 예시
-- `config.toml`: 실제 실행 설정
-- `output/YYYYMMDD/`: 날짜별 원본·분석 후보 JSONL과 실행 요약
-- `pyproject.toml`: 패키지, 실행 명령과 개발 도구 설정
+## 한계
 
-## 안전장치
-
-- `--company`, `--group`, `--all-enabled` 중 하나로 실행 범위를 명시
-- 설정에 `enabled = true`인 기업만 실행
-- 검증된 `allowed_domains`에 속하는 URL만 후보로 저장
-- 대상 기업 서버가 아닌 CT, 공개 DNS, Common Crawl, Wayback만 조회
-- `site:` 검색은 자동 스크래핑하지 않고 검색 쿼리만 생성
-- 공개 색인 요청 수, 응답 크기, 요청 간격과 재시도 횟수 제한
-- 발견한 API, 자격증명, DB 및 스토리지에 직접 접근하지 않음
-
-## 시작하기
-
-Python 3.11 이상이 필요하다.
-
-```bash
-python -m pip install -e .
-cp config.example.toml config.toml
-```
-
-`config.toml`에서 예시 기업을 실제 조사 기업으로 교체한다. 도메인과 소유 근거를 직접 검증한 후에만 `enabled = true`로 바꾼다.
-
-설정 검사:
-
-```bash
-exposure-lens validate --config config.toml
-```
-
-요청 없이 실행 계획 확인:
-
-```bash
-exposure-lens collect --config config.toml --company example --dry-run
-```
-
-수집 실행:
-
-```bash
-exposure-lens collect \
-  --config config.toml \
-  --company example
-```
-
-`--company`에는 설정의 `company_id`를 입력한다. 여러 기업은 그룹 단위로 순차 실행한다.
-
-```bash
-exposure-lens collect \
-  --config config.toml \
-  --group pilot
-```
-
-결과는 `output/YYYYMMDD/`에 저장된다. `_raw.jsonl`에는 공개 색인에서 발견한 URL 원문을 보존하고, `_candidates.jsonl`에는 HTTP/HTTPS, `www`, 쿼리 변형을 통합한 대표 URL과 우선순위를 기록한다. 
-뉴스·보도자료·사진 등 낮은 우선순위는 원본에만 남기고 분석 후보에서는 제외한다.
-
-`summary.md`에는 실행 대상, 수집 방식, 출처, `site:` 검색 쿼리와 오류가 함께 기록된다. 
-출력 상위 경로는 `--output`으로 변경할 수 있으며, 모든 활성 기업은`--all-enabled`로 선택할 수 있다.
-
-수집기는 대상 기업 웹사이트에 직접 요청하지 않는다. URL은 쿼리 문자열을 마스킹하지 않고 저장하므로 결과 파일에 비밀정보가 포함될 수 있다. 결과를 외부에 공유하거나 버전 관리에 포함하지 않는다.
-
-`PASSIVE`는 수집 방식이지 트랙 이름이 아니다. 
-공개 색인에서 발견했더라도 기업이 직접 공개한 자산이면 `track`은 `DIRECT`이며 후보 ID는 `DIR_`로 시작한다.
-
-## 설정 원칙
-
-- `allowed_domains`: 해당 기업의 소유 관계가 검증된 공식 도메인
-- `fetch_domains`: 향후 승인된 직접 수집에서만 사용할 요청 허용 도메인
-- `seed_urls`: 공식 도메인에서 확인된 기본 URL 후보
-- `ownership_evidence_urls`: 도메인 소유 관계를 사람이 검증한 근거
-- `official_repositories`: 기업 소유가 확인된 GitHub·GitLab 저장소
-- `security_contact`: 발견 시 연락할 공식 보안 채널
-- `indicator`: 후보 레코드에 기록할 기업 식별자
-- `company_code`: 후보 ID에 사용할 2~12자의 영문 대문자·숫자 코드
-- `groups`: 여러 기업을 순차 실행할 때 사용할 그룹 이름
-
-외부 CDN이나 저장소는 기업과의 소유·연결 관계가 검증된 경우에만 공식 자산으로 분류한다.
-
-## 출력 예시
-
-```json
-{
-  "candidate_id":"DIR_EXAMPLE_20260827_000001",
-  "track":"DIRECT",
-  "company_name":"예시기업",
-  "source_platform":"common_crawl",
-  "source_url":"https://index.commoncrawl.org/...",
-  "target_platform":"company_web",
-  "target_url":"https://example.com/openapi.json",
-  "discovery_method":"common_crawl",
-  "matched_indicator":"예시기업 공식 도메인",
-  "discovered_at":"2026-08-27T15:30:00+09:00",
-  "content_hint":"json"
-}
-```
-
-`source_url`은 후보를 제공한 공개 색인이고 `target_url`은 기업 자산 후보이다.
-실제 노출 여부나 현재 접근 가능 여부는 검증하지 않는다.
-
-## 현재 MVP의 한계
-
-- 검색엔진 결과를 자동으로 가져오지 않고 `site:` 쿼리만 생성
-- 공개 색인에 포함되지 않은 최신·비색인 URL은 발견할 수 없음
-- HTTP/HTTPS, `www`, 쿼리 변형에 대한 의미 기반 중복 제거는 아직 없음
-- Wayback 후보는 과거 기록이며 현재 자산임을 보장하지 않음
-- 자산 소유 관계는 자동 판정하지 않음
-- 민감성 및 공개 의도는 자동 판정하지 않음
-
-## 트랙 확장
-
-- `DIRECT`: 기업이 직접 공개한 공식 도메인·저장소 자산
-- `REDISTRIBUTION`: 팀원이 별도 수집기로 구현할 재배포·유통 자산
-
-두 트랙은 설정과 공통 후보 모델을 공유하되 수집기와 출력은 분리한다. 
-URL 수집과 후속 민감정보 분석도 별도 단계로 유지한다.
+- apex 발견은 crt.sh 조직 검색에 크게 의존하며, 인증서에 조직명이 없는 자산은 seed로 보완해야 한다.
+- 공개 색인에 없는 최신·비색인 자산은 발견하지 못한다.
+- Wayback 결과는 과거 기록이므로 현재도 접근 가능하다는 보장은 없다.
+- IPv6 자산의 ASN 매핑은 아직 지원하지 않는다.
