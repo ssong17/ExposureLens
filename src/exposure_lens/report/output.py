@@ -14,6 +14,11 @@ class Serializable(Protocol):
     def to_dict(self) -> dict[str, object]: ...
 
 
+def read_jsonl(path: str | Path) -> list[dict]:
+    with Path(path).open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
 def write_jsonl(rows: list[Serializable], path: str | Path) -> None:
     with Path(path).open("w", encoding="utf-8", newline="\n") as handle:
         for row in rows:

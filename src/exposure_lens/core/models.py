@@ -7,6 +7,7 @@ from typing import Literal
 
 Confidence = Literal["high", "medium", "low"]
 AssetType = Literal["apex", "subdomain", "ip", "endpoint"]
+Severity = Literal["critical", "high", "medium", "low"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,23 @@ class Asset:
     resolved_ip: str = ""
     asn: str = ""
     in_scope: bool = True
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class Finding:
+    finding_id: str
+    org_id: str
+    asset_ref: str
+    severity: Severity
+    category: str
+    rule: str
+    host: str
+    url: str
+    evidence: str
+    discovered_at: str
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

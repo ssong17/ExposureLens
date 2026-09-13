@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 
 from .apex.discovery import discover_apex
@@ -9,7 +10,8 @@ from .collect.collector import collect_org
 from .core.config import AppConfig, OrgConfig, load_config
 from .core.models import ApexCandidate, Asset, run_date
 from .core.net import Http
-from .report.output import write_jsonl, write_summary
+from .report.output import read_jsonl, write_jsonl, write_summary
+from .scan.scanner import scan_assets
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +45,16 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument(
                 "--quiet", "-q", action="store_true", help="suppress progress logs"
             )
+
+    s = sub.add_parser("scan", help="scan collected assets for exposures")
+    s.add_argument("--assets", "-a", required=True, help="path to an assets.jsonl file")
+    s.add_argument("--output", "-o", default="output", help="output root directory")
+    s.add_argument(
+        "--min-severity",
+        choices=["critical", "high", "medium", "low"],
+        default="medium",
+        help="lowest severity to report (default: medium)",
+    )
     return parser
 
 
@@ -140,6 +152,34 @@ def _run_collect(app: AppConfig, args: argparse.Namespace) -> int:
     return _finish(out_dir, f"collection - {run_date()}", problems, http)
 
 
+def _run_scan(args: argparse.Namespace) -> int:
+    assets = read_jsonl(args.assets)
+    findings = scan_assets(assets, min_severity=args.min_severity)
+    out_dir = Path(args.output) / run_date()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(findings, out_dir / "findings.jsonl")
+
+    counts = Counter(f.severity for f in findings)
+    print(
+        f"scanned {len(assets)} assets - {len(findings)} findings "
+        f"(critical {counts['critical']}, high {counts['high']}, "
+        f"medium {counts['medium']}, low {counts['low']})"
+    )
+    for f in findings[:30]:
+        print(f"  {f.severity:<8} {f.category:<16} {f.host} {f.evidence}")
+    if len(findings) > 30:
+        print(f"  ... and {len(findings) - 30} more")
+
+    actionable = [
+        f"{f.severity.upper()} [{f.category}] {f.host} {f.evidence} {f.url}".strip()
+        for f in findings
+        if f.severity in ("critical", "high")
+    ]
+    write_summary(out_dir / "findings_summary.md", f"scan - {run_date()}", actionable)
+    print(f"\noutput {out_dir}")
+    return 0
+
+
 def _force_utf8() -> None:
     # Keep Korean/box output intact on Windows consoles (cp949).
     for stream in (sys.stdout, sys.stderr):
@@ -153,6 +193,8 @@ def main(argv: list[str] | None = None) -> int:
     _force_utf8()
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "scan":
+            return _run_scan(args)
         app = load_config(args.config)
         if args.command == "validate":
             print(f"config valid: {len(app.orgs)} orgs")
