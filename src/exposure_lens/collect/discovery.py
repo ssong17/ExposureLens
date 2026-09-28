@@ -15,17 +15,24 @@ from __future__ import annotations
 from collections import Counter
 
 from ..core.config import OrgConfig
-from ..core.models import ApexCandidate, timestamp_now
+from ..core.models import CONFIDENCE_ORDER, ApexCandidate, timestamp_now
 from ..core.net import Http
 from ..sources import crtsh
-from .tldclass import expected_classes, is_infra_apex, registrable_apex, tld_class
+from .tldclass import (
+    expected_classes,
+    is_infra_apex,
+    main_label,
+    registrable_apex,
+    tld_class,
+)
 
 MIN_CERTS = 2
 DOMINANT_SHARE = 0.15
 
 
 def _confidence(
-    apex: str, count: int, total: int, is_top: bool, org: OrgConfig
+    apex: str, count: int, total: int, is_top: bool, org: OrgConfig,
+    seed_labels: frozenset[str],
 ) -> tuple[str, list[str]]:
     evidence = [f"certs:{count}"]
     tld_match = tld_class(apex) in expected_classes(org.org_type)
@@ -37,11 +44,29 @@ def _confidence(
         return "high", evidence
 
     share = count / total if total else 0.0
-    if is_top and count >= MIN_CERTS and (tld_match or share >= DOMINANT_SHARE):
+    dominant = is_top and count >= MIN_CERTS and (tld_match or share >= DOMINANT_SHARE)
+
+    # Seed anchoring: when the org's real domains are known, a matching TLD class
+    # only says "some school/company", not "this one". An apex from a different
+    # registrable family (no shared main label) must earn trust through
+    # certificate dominance, not the TLD class alone — this keeps sibling
+    # institutions (seoultech.ac.kr vs snu.ac.kr) out of the medium tier.
+    anchored = bool(seed_labels)
+    related = (not anchored) or (main_label(apex) in seed_labels)
+    if anchored and related:
+        evidence.append("seed_family")
+
+    # Cert dominance grants high ONLY when unanchored or in the seed family.
+    # Otherwise a same-named foreign org that dominates crt.sh (e.g. SOCAR the
+    # oil company vs 쏘카 socarcorp.kr) would hijack the collection.
+    if dominant and related:
         evidence.append("cert_rank_1")
         return "high", evidence
-    if tld_match and count >= MIN_CERTS:
+    if tld_match and count >= MIN_CERTS and related:
         return "medium", evidence
+    if tld_match and count >= MIN_CERTS and not related:
+        evidence.append("unrelated_family")
+        return "low", evidence
     return "low", evidence
 
 
@@ -73,10 +98,13 @@ def discover_apex(http: Http, org: OrgConfig) -> tuple[list[ApexCandidate], list
     ranked = counts.most_common()
     top_apex = ranked[0][0]
     at = timestamp_now()
+    seed_labels = frozenset(main_label(s) for s in org.seed_domains if main_label(s))
 
     candidates = []
     for apex, count in ranked:
-        confidence, evidence = _confidence(apex, count, total, apex == top_apex, org)
+        confidence, evidence = _confidence(
+            apex, count, total, apex == top_apex, org, seed_labels
+        )
         candidates.append(
             ApexCandidate(
                 org_id=org.org_id,
@@ -90,6 +118,5 @@ def discover_apex(http: Http, org: OrgConfig) -> tuple[list[ApexCandidate], list
             )
         )
 
-    order = {"high": 0, "medium": 1, "low": 2}
-    candidates.sort(key=lambda c: (order[c.confidence], -c.cert_count))
+    candidates.sort(key=lambda c: (CONFIDENCE_ORDER[c.confidence], -c.cert_count))
     return candidates, errors

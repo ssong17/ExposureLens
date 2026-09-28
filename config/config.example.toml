@@ -1,0 +1,18 @@
+# 설정은 config/ 폴더로 관리한다.
+#
+#   config/
+#     _collector.toml            공통 수집기 설정 ([collector] 한 곳)
+#     config_<분야>.toml         기관 목록([[orgs]] 여러 개), 또는
+#     <org_id>.toml              기관 하나당 한 파일
+#
+# 이 파일은 기관 항목 형식 예시다. 실제로는 config/ 안에 두고 config.example
+# 접미사를 뗀다. [collector] 는 config/_collector.toml 에만 둔다.
+
+[[orgs]]
+org_id = "example"                 # 영소문자/숫자/_/-, 32자 이내. 고유
+name = "Example Organization"      # crt.sh 조직 검색에 쓰인다
+org_type = "company"               # apex 힌트. 자유 문자열 허용
+enabled = false                    # true 인 기관만 대상
+groups = ["pilot"]                 # (선택) --group 실행용
+search_names = ["예시기관"]         # (선택) 별칭·한글명으로 검색 보강
+seed_domains = ["example.com"]     # (선택) 아는 apex. 있으면 confidence high

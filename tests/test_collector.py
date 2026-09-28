@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from exposure_lens.apex.discovery import discover_apex
-from exposure_lens.apex.tldclass import registrable_apex, tld_class
+from exposure_lens.collect.discovery import discover_apex
+from exposure_lens.collect.tldclass import registrable_apex, tld_class
 from exposure_lens.collect.collector import _is_endpoint, select_target_apexes
 from exposure_lens.core.config import OrgConfig
 from exposure_lens.core.models import ApexCandidate

@@ -21,3 +21,9 @@ def fetch_urls(http: Http, apex: str, limit: int = 1000) -> list[str]:
     if not isinstance(data, list) or len(data) < 2:
         return []
     return [row[0] for row in data[1:] if isinstance(row, list) and row]
+
+
+def fetch_observations(http: Http, apex: str, limit: int = 1000) -> list[dict]:
+    """Same URLs as observations. Wayback is an archive, so ``seen`` stays empty —
+    the collector treats these as historical unless a current source confirms."""
+    return [{"url": u, "seen": "", "status": ""} for u in fetch_urls(http, apex, limit)]

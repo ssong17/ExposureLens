@@ -6,9 +6,6 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-VALID_ORG_TYPES = frozenset(
-    {"company", "gov", "school", "nonprofit", "research", "other"}
-)
 _ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 
 
@@ -17,13 +14,33 @@ class CollectorConfig:
     user_agent: str = "PublicAssetResearch/0.2 (+security-research)"
     request_interval_seconds: float = 2.0
     timeout_seconds: float = 30.0
-    max_retries: int = 1
-    max_requests: int = 1000
-    max_apex_per_org: int = 25
-    max_endpoints_per_org: int = 3000
+    max_retries: int = 3
+    retry_backoff_seconds: float = 2.0
+    # Volume limits: 0 = unlimited (process everything found). There is no
+    # truncation cap any more — a run finishes the whole target, pausing between
+    # organizations to stay polite instead of cutting work off partway. Per-host
+    # request_interval_seconds is what actually protects the free-tier indexes.
+    max_requests: int = 0
+    max_apex_per_org: int = 0
+    max_endpoints_per_org: int = 0
     resolve_timeout: float = 3.0
     resolve_workers: int = 20
-    max_response_bytes: int = 30_000_000
+    # Seconds to rest between organizations (0 = no pause). Sequential-with-rest
+    # replaces the old request cap: it lets a big run complete without hammering
+    # crt.sh/Wayback/urlscan into rate-limiting the whole thing.
+    org_pause_seconds: float = 5.0
+    # Index responses (crt.sh org search for a large org is genuinely big).
+    max_response_bytes: int = 8_000_000
+    # Bodies read for content rules. Separate and much smaller: a secret lives in
+    # the first few hundred KB, and the old shared 30MB cap meant one probe could
+    # pull 30MB into memory and run every regex over it.
+    max_body_bytes: int = 1_000_000
+    # Per-apex fetch limits, previously hard-coded at the call sites so raising
+    # max_endpoints_per_org above ~1100/apex had no effect.
+    wayback_limit: int = 1000
+    urlscan_limit: int = 100
+    # Bounded parsed-JSON cache (entries).
+    cache_entries: int = 128
 
 
 @dataclass(frozen=True)
@@ -63,48 +80,117 @@ class AppConfig:
         return orgs
 
 
+def _load_raw(path: Path) -> dict:
+    """Read config from a single .toml file OR a directory of them.
+
+    A directory (the preferred layout) holds one file per organization plus a
+    shared collector file:
+
+        config/
+          _collector.toml   -> [collector] block
+          ncsoft.toml        -> [[orgs]] (one) or top-level org fields
+          cafe24.toml
+          ...
+
+    Every file's [collector] is merged (later files win per key) and every
+    file's orgs are concatenated, so splitting the old single config.toml into
+    one-file-per-org changes nothing about the result.
+    """
+    if not path.is_dir():
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+
+    # *.example.toml 은 형식 예시이므로 로드 대상에서 제외한다.
+    files = sorted(
+        p for p in path.glob("*.toml")
+        if p.is_file() and ".example." not in p.name
+    )
+    if not files:
+        raise ValueError(f"config 폴더에 .toml 파일이 없습니다: {path}")
+    collector: dict = {}
+    orgs: list = []
+    for f in files:
+        with f.open("rb") as handle:
+            raw = tomllib.load(handle)
+        if isinstance(raw.get("collector"), dict):
+            collector.update(raw["collector"])
+        orgs.extend(raw.get("orgs", []))
+        # A per-org file may also put the org fields at the top level instead of
+        # under [[orgs]]; treat that as a single org.
+        if "org_id" in raw:
+            orgs.append(
+                {k: v for k, v in raw.items() if k not in ("collector", "orgs")}
+            )
+    return {"collector": collector, "orgs": orgs}
+
+
 def load_config(path: str | Path) -> AppConfig:
-    with Path(path).open("rb") as handle:
-        raw = tomllib.load(handle)
+    raw = _load_raw(Path(path))
 
     c = raw.get("collector", {})
+
+    def _num(key, cast, default):
+        try:
+            return cast(c.get(key, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"[collector] {key} 값이 잘못되었습니다: {exc}") from exc
+
     collector = CollectorConfig(
         user_agent=str(c.get("user_agent", CollectorConfig.user_agent)),
-        request_interval_seconds=float(
-            c.get("request_interval_seconds", CollectorConfig.request_interval_seconds)
+        request_interval_seconds=_num(
+            "request_interval_seconds", float,
+            CollectorConfig.request_interval_seconds,
         ),
-        timeout_seconds=float(c.get("timeout_seconds", CollectorConfig.timeout_seconds)),
-        max_retries=int(c.get("max_retries", CollectorConfig.max_retries)),
-        max_requests=int(c.get("max_requests", CollectorConfig.max_requests)),
-        max_response_bytes=int(
-            c.get("max_response_bytes", CollectorConfig.max_response_bytes)
+        timeout_seconds=_num("timeout_seconds", float, CollectorConfig.timeout_seconds),
+        max_retries=_num("max_retries", int, CollectorConfig.max_retries),
+        retry_backoff_seconds=_num(
+            "retry_backoff_seconds", float, CollectorConfig.retry_backoff_seconds
         ),
-        max_apex_per_org=int(
-            c.get("max_apex_per_org", CollectorConfig.max_apex_per_org)
+        max_requests=_num("max_requests", int, CollectorConfig.max_requests),
+        org_pause_seconds=_num(
+            "org_pause_seconds", float, CollectorConfig.org_pause_seconds
         ),
-        max_endpoints_per_org=int(
-            c.get("max_endpoints_per_org", CollectorConfig.max_endpoints_per_org)
+        max_response_bytes=_num(
+            "max_response_bytes", int, CollectorConfig.max_response_bytes
         ),
-        resolve_timeout=float(c.get("resolve_timeout", CollectorConfig.resolve_timeout)),
-        resolve_workers=int(c.get("resolve_workers", CollectorConfig.resolve_workers)),
+        max_body_bytes=_num("max_body_bytes", int, CollectorConfig.max_body_bytes),
+        max_apex_per_org=_num(
+            "max_apex_per_org", int, CollectorConfig.max_apex_per_org
+        ),
+        max_endpoints_per_org=_num(
+            "max_endpoints_per_org", int, CollectorConfig.max_endpoints_per_org
+        ),
+        resolve_timeout=_num("resolve_timeout", float, CollectorConfig.resolve_timeout),
+        resolve_workers=_num("resolve_workers", int, CollectorConfig.resolve_workers),
+        wayback_limit=_num("wayback_limit", int, CollectorConfig.wayback_limit),
+        urlscan_limit=_num("urlscan_limit", int, CollectorConfig.urlscan_limit),
+        cache_entries=_num("cache_entries", int, CollectorConfig.cache_entries),
     )
 
-    orgs = tuple(
-        OrgConfig(
-            org_id=str(item["org_id"]).lower(),
-            name=str(item["name"]),
-            org_type=str(item.get("org_type", "other")).lower(),
-            enabled=bool(item.get("enabled", False)),
-            groups=tuple(str(x) for x in item.get("groups", [])),
-            search_names=tuple(str(x) for x in item.get("search_names", [])),
-            seed_domains=tuple(
-                str(x).lower().strip(".") for x in item.get("seed_domains", [])
-            ),
+    orgs = []
+    for index, item in enumerate(raw.get("orgs", []), 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"{index}번째 [[orgs]] 항목이 테이블이 아닙니다.")
+        for required in ("org_id", "name"):
+            if required not in item:
+                raise ValueError(
+                    f"{index}번째 [[orgs]] 항목에 필수 키 '{required}'가 없습니다."
+                )
+        orgs.append(
+            OrgConfig(
+                org_id=str(item["org_id"]).lower(),
+                name=str(item["name"]),
+                org_type=str(item.get("org_type", "other")).lower(),
+                enabled=bool(item.get("enabled", False)),
+                groups=tuple(str(x) for x in item.get("groups", [])),
+                search_names=tuple(str(x) for x in item.get("search_names", [])),
+                seed_domains=tuple(
+                    str(x).lower().strip(".") for x in item.get("seed_domains", [])
+                ),
+            )
         )
-        for item in raw.get("orgs", [])
-    )
 
-    app = AppConfig(collector=collector, orgs=orgs)
+    app = AppConfig(collector=collector, orgs=tuple(orgs))
     validate_config(app)
     return app
 
@@ -115,14 +201,27 @@ def validate_config(app: AppConfig) -> None:
         raise ValueError("request_interval_seconds는 0 이상이어야 합니다.")
     if col.timeout_seconds <= 0 or col.max_response_bytes <= 0:
         raise ValueError("timeout_seconds와 max_response_bytes는 0보다 커야 합니다.")
-    if not 0 <= col.max_retries <= 3:
-        raise ValueError("max_retries는 0~3 범위여야 합니다.")
-    if not 1 <= col.max_requests <= 5000:
-        raise ValueError("max_requests는 1~5000 범위여야 합니다.")
-    if not 1 <= col.max_apex_per_org <= 200:
-        raise ValueError("max_apex_per_org는 1~200 범위여야 합니다.")
+    if col.max_body_bytes <= 0:
+        raise ValueError("max_body_bytes는 0보다 커야 합니다.")
+    if col.max_body_bytes > col.max_response_bytes:
+        raise ValueError("max_body_bytes는 max_response_bytes 이하여야 합니다.")
+    if not 0 <= col.max_retries <= 5:
+        raise ValueError("max_retries는 0~5 범위여야 합니다.")
+    if col.retry_backoff_seconds < 0:
+        raise ValueError("retry_backoff_seconds는 0 이상이어야 합니다.")
+    # 0 = unlimited for all three volume limits.
+    if col.max_requests < 0:
+        raise ValueError("max_requests는 0 이상이어야 합니다 (0 = 무제한).")
+    if col.max_apex_per_org < 0:
+        raise ValueError("max_apex_per_org는 0 이상이어야 합니다 (0 = 무제한).")
     if col.max_endpoints_per_org < 0:
-        raise ValueError("max_endpoints_per_org는 0 이상이어야 합니다.")
+        raise ValueError("max_endpoints_per_org는 0 이상이어야 합니다 (0 = 무제한).")
+    if col.org_pause_seconds < 0:
+        raise ValueError("org_pause_seconds는 0 이상이어야 합니다.")
+    if col.wayback_limit < 0 or col.urlscan_limit < 0:
+        raise ValueError("wayback_limit과 urlscan_limit은 0 이상이어야 합니다.")
+    if col.cache_entries < 0:
+        raise ValueError("cache_entries는 0 이상이어야 합니다.")
     if col.resolve_timeout <= 0 or col.resolve_workers < 1:
         raise ValueError("resolve_timeout>0, resolve_workers>=1 이어야 합니다.")
 
@@ -137,7 +236,9 @@ def validate_config(app: AppConfig) -> None:
         seen.add(org.org_id)
         if not org.name.strip():
             raise ValueError(f"{org.org_id}: name이 비어 있습니다.")
-        if org.org_type not in VALID_ORG_TYPES:
-            raise ValueError(
-                f"{org.org_id}: org_type은 {sorted(VALID_ORG_TYPES)} 중 하나여야 합니다."
-            )
+        # org_type is only a hint for apex discovery's TLD-class match; an
+        # unknown value just means "no hint" (see tldclass.expected_classes).
+        # So any non-empty string is allowed — the Notion export uses free-form
+        # category names like "IT & Software", and rejecting those is wrong.
+        if not org.org_type:
+            raise ValueError(f"{org.org_id}: org_type이 비어 있습니다.")

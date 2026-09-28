@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -7,8 +8,27 @@ __pycache__/
 .venv/
 venv/
 
-# Local runtime configuration and collector output
-config.toml
-candidates.jsonl
-runs/
+# 조사 대상 목록·설정: 실제 기관 목록과 시드 도메인이 들어가므로 올리지 않는다.
+# config/ 에서는 형식 예시(config.example.toml)만 추적한다.
+config/*
+!config/config.example.toml
+config.toml*
+
+# 수집·검사 결과 (자산 목록, 발견 내역)
 output/
+runs/
+candidates.jsonl
+*.jsonl
+
+# 자격증명·비밀 (방어적: 실수로 커밋되는 것 차단)
+*.env
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*credentials*
+*secret*.toml
+*.local.toml

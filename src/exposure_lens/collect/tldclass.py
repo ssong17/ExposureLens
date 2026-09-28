@@ -52,6 +52,22 @@ def registrable_apex(host: str) -> str:
     return ".".join(labels[-2:])
 
 
+def main_label(apex: str) -> str:
+    """Return the registrable label of an apex (e.g. snu.ac.kr -> 'snu').
+
+    Used to tell whether a candidate apex belongs to the same registrable family
+    as a known seed: snu.ac.kr and seoultech.ac.kr share a TLD class but not a
+    main label, so the latter is a different institution, not a sibling asset.
+    """
+    a = apex.strip().lower().strip(".")
+    labels = a.split(".")
+    if len(labels) >= 3 and ".".join(labels[-2:]) in TWO_LEVEL_SUFFIXES:
+        return labels[-3]
+    if len(labels) >= 2:
+        return labels[-2]
+    return labels[0] if labels and labels[0] else ""
+
+
 def tld_class(apex: str) -> str:
     """Classify an apex by ownership type (gov/school/company/...)."""
     a = apex.lower()

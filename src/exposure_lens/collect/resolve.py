@@ -8,7 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 def _first_ipv4(host: str) -> str:
     try:
         infos = socket.getaddrinfo(host, None)
-    except OSError:
+    except (OSError, UnicodeError):
+        # UnicodeError: malformed host (empty/invalid IDNA label) — treat as
+        # unresolvable rather than crashing the run.
         return ""
     for family, _, _, _, sockaddr in infos:
         if family == socket.AF_INET:
