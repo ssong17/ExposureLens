@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from exposure_lens.core.models import FindingIds
-from exposure_lens.scan.scanner import _mask, scan_assets, scan_body
+from exposure_lens.scan.scanner import _mask, _mask_match, scan_assets, scan_body
 
 
 def _asset(**kw) -> dict:
@@ -106,3 +106,99 @@ def test_secrets_in_body_still_masked():
     sec = next(f for f in fs if f.category == "leaked-secret")
     assert "****" in sec.evidence
     assert "ABCDEFGHIJKLMNOP" not in sec.evidence
+
+
+# ---- scan_body: masking and severity floor (moved from test_inspect) ---------
+
+def test_mask_match_keeps_key_hides_value():
+    masked = _mask_match('password: "hunter2secret"')
+    assert "hunter2secret" not in masked
+    assert masked.startswith("password:")
+
+
+def test_scan_body_detects_and_masks_multiple_categories():
+    body = (
+        'apiKey: "AKIAABCDEFGHIJKLMNOP"\n'
+        'DATABASE_URL = "postgres://admin:s3cr3tpw@db.internal:5432/prod"\n'
+        "resident 900101-1234567\n"
+    )
+    fs = _body(body)
+    cats = {f.category for f in fs}
+    assert {"leaked-secret", "db-exposure", "pii-exposure"} <= cats
+    assert all("s3cr3tpw" not in f.evidence for f in fs)
+    assert all("1234567" not in f.evidence for f in fs)
+
+
+def test_scan_body_respects_min_severity():
+    body = "resident 900101-1234567"  # high-severity pii rule
+    ids = FindingIds("T", date="20260101")
+    assert scan_body(
+        body, asset={"record_id": "R", "host": "h"}, url="u", status="",
+        source="wayback-body", min_severity="high", next_id=ids,
+    )
+    assert not scan_body(
+        body, asset={"record_id": "R", "host": "h"}, url="u", status="",
+        source="wayback-body", min_severity="critical", next_id=ids,
+    )
+
+
+# ---- path severity: evidence strength, not scary names -----------------------
+
+def _endpoint(url, freshness="current", rid="E1"):
+    return _asset(record_id=rid, asset_type="endpoint", url=url,
+                  host=url.split("/")[2], freshness=freshness)
+
+
+def _rules_for(url, **kw):
+    return {(f.rule, f.severity) for f in scan_assets([_endpoint(url, **kw)],
+                                                       min_severity="low")}
+
+
+def test_plain_zip_download_is_not_a_backup():
+    # Field runs: bid attachments and CI logo zips were all ranked high.
+    assert not _rules_for("https://x.com/cgi-bin/attach_file/bid/20040407.Zip")
+    assert not _rules_for("https://x.com/static/data/CI_Logo.zip")
+
+
+def test_dump_in_a_page_name_is_not_a_db_dump():
+    assert not _rules_for("https://x.com/bbs/dump-truck-hydraulic-system.html")
+    assert not _rules_for("https://x.com/find-a-car/special-vehicle/dump")
+
+
+def test_real_backup_shapes_still_match():
+    assert ("path-db-dump", "high") in _rules_for("https://x.com/db.sql")
+    assert ("path-backup-copy", "high") in _rules_for("https://x.com/index.php.bak")
+    assert ("path-backup-archive", "high") in _rules_for("https://x.com/www_backup.zip")
+    assert ("path-backup-archive", "high") in _rules_for("https://x.com/backups/2020.tgz")
+
+
+def test_one_backup_finding_per_url():
+    rules = _rules_for("https://x.com/backups/2020.tgz")
+    assert rules == {("path-backup-archive", "high")}  # not also backup-dir
+
+
+def test_wayback_only_path_is_a_notch_lower():
+    assert ("path-vcs", "high") in _rules_for("https://x.com/.git/config")
+    assert ("path-vcs", "medium") in _rules_for(
+        "https://x.com/.git/config", freshness="archived")
+
+
+def test_admin_route_is_surface_not_exposure():
+    assert _rules_for("https://x.com/admin/") == {("path-admin", "low")}
+
+
+def test_query_variants_of_one_path_collapse():
+    assets = [
+        _endpoint(f"https://x.com/admin/input.jsp?page={i}", rid=f"E{i}")
+        for i in range(5)
+    ]
+    fs = scan_assets(assets, min_severity="low")
+    assert len(fs) == 1
+    assert "(+4 query variants)" in fs[0].evidence
+
+
+def test_secret_in_archived_url_keeps_full_severity():
+    # A credential sitting in a public archive is readable by anyone today.
+    fs = scan_assets([_endpoint("https://x.com/a?x=AKIAABCDEFGHIJKLMNOP",
+                                freshness="archived")], min_severity="low")
+    assert ("secret-aws-akid", "critical") in {(f.rule, f.severity) for f in fs}

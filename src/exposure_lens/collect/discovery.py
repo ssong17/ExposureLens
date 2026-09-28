@@ -16,7 +16,7 @@ from collections import Counter
 
 from ..core.config import OrgConfig
 from ..core.models import CONFIDENCE_ORDER, ApexCandidate, timestamp_now
-from ..core.net import Http
+from ..core.net import Http, NetworkDown
 from ..sources import crtsh
 from .tldclass import (
     expected_classes,
@@ -78,6 +78,8 @@ def discover_apex(http: Http, org: OrgConfig) -> tuple[list[ApexCandidate], list
     for name in (org.name, *org.search_names):
         try:
             records = crtsh.org_search(http, name)
+        except NetworkDown:
+            raise
         except Exception as exc:  # noqa: BLE001 - report source failures in summary
             errors.append(f"crt.sh org='{name}': {exc}")
             continue

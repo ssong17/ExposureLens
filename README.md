@@ -38,15 +38,21 @@ user_agent = "PublicAssetResearch/0.2 (+security-research)"
 request_interval_seconds = 2.0   # 요청 간격(초), 호스트별 적용
 timeout_seconds = 30.0
 max_retries = 3
+retry_delays_seconds = [5, 15, 30]  # 재시도 전 대기(초): 1·2·3회차
 max_requests = 0                 # 0 = 무제한
 max_apex_per_org = 0             # 0 = 무제한
 max_endpoints_per_org = 0        # 0 = 무제한
-org_pause_seconds = 5.0          # 기관 사이 휴식(초)
+org_pause_seconds = 10.0         # 기관 사이 휴식(초)
 max_response_bytes = 8000000     # 색인 응답 상한
 max_body_bytes = 1000000         # 본문 규칙 대상 상한(응답 상한 이하)
+wayback_limit = 1000             # Wayback 조회 1회당 URL 상한
+wayback_split = true             # 상한 도달/실패 시 호스트별 재조회
+max_wayback_split_hosts = 300    # apex 당 호스트별 재조회 상한 (0 = 무제한)
 ```
 
 한도(`max_*`)는 0이면 무제한이며, 발견된 것을 전부 처리한다. 기관 사이에는 `org_pause_seconds`만큼 쉰다.
+
+일시적 오류(429/5xx, 연결 실패·타임아웃)는 `retry_delays_seconds` 간격으로 재시도한다. 연결 자체가 연속 3번(각각 재시도 소진 후) 실패하면 네트워크 끊김으로 보고 단계를 멈춘다(exit 3). 502 같은 서버 응답이나 읽기 타임아웃(crt.sh 지연)은 끊김으로 세지 않는다.
 
 ### `[[orgs]]`
 
@@ -93,15 +99,30 @@ exposure-lens collect --all-enabled
 - apex 발견: crt.sh 조직 검색, 동명 타 기관은 confidence로 격리
 - 서브도메인: crt.sh + Wayback
 - 엔드포인트: Wayback(과거) + urlscan.io(최근)
+  - Wayback은 apex 단위(`*.apex`)로 한 번 조회한다. 결과는 호스트 알파벳 순이라, `wayback_limit`에 꽉 차면 앞쪽 호스트만 담기고 뒤쪽 서브도메인은 빠진다. 꽉 찼거나 조회가 실패하면(큰 와일드카드의 타임아웃) 그 apex의 **지금 해석되는 호스트**를 하나씩 다시 조회한다(apex 당 `max_wayback_split_hosts`개까지, 이미 온전히 받은 호스트는 제외). 몇 개를 조회했는지·생략했는지는 summary의 Problems에 남는다
 - IP: 시스템 DNS 해석 / ASN: Team Cymru
 
 | 옵션 | 설명 |
 | --- | --- |
 | `--fresh` | 누적하지 않고 기존 결과를 버리고 새로 시작 |
+| `--resume` | 중단된 최신 collect를 끊긴 곳부터 이어서 |
 | `--no-resolve` | IP/ASN 조회 생략 |
 | `--no-endpoints` | Wayback 엔드포인트 생략 |
 
 기본 동작은 기존 collect 결과에 누적(중복 제거)이다. 공개 색인은 실행마다 결과가 달라, 여러 번 실행하면 합집합이 커진다. 기관 하나가 끝날 때마다 결과 파일을 다시 쓴다.
+
+#### 이어서 실행 (`--resume`)
+
+실행 중에는 `<시각>_collect.progress.json`이 결과 옆에 생기고, 정상 종료하면 지워진다. 파일이 남아 있으면 그 실행이 중간에 끊겼다는 뜻이다(네트워크 끊김, Ctrl-C, 오류).
+
+```bash
+exposure-lens collect --all-enabled            # 도중에 끊김
+exposure-lens collect --all-enabled --resume   # 끊긴 곳부터
+```
+
+- 끝난 기관은 건너뛰고, 진행 중이던 기관은 apex 단위로 이어서 한다(이미 받은 apex 후보·호스트·엔드포인트 재사용)
+- 연결 실패로 잘린 단계(apex 탐색, apex 하나, DNS 해석)는 완료로 치지 않는다. 실행이 끝나도 진행 파일이 남아 `--resume` 때 그 단계만 다시 한다
+- 같은 시각 접두사의 파일에 이어 쓴다(새 파일을 만들지 않음)
 
 ### scan (passive)
 
@@ -123,6 +144,9 @@ exposure-lens scan --assets output/20260928/143052_collect.jsonl
 | `--assets`, `-a` | 검사할 collect JSONL (생략 시 최신) |
 | `--min-severity` | 보고 하한 (기본 medium) |
 | `--no-services` | Shodan 현재-서비스 검사 생략 |
+| `--resume` | 중단된 최신 scan을 이어서 (이미 받은 Shodan 응답 재사용) |
+
+scan 도 IP마다 Shodan 응답을 `<시각>_scan.progress.jsonl`에 기록한다. 끊기면 `scan.jsonl`을 쓰지 않고(미완료가 완료처럼 보이지 않게) 멈추며, `--resume`은 남은 IP만 조회한다. 조회에 실패한 IP는 "열린 포트 없음"으로 치지 않고 Problems에 남긴다.
 
 ### probe (active)
 
@@ -142,7 +166,7 @@ exposure-lens probe --source wayback
 | --- | --- |
 | `--source` | `fetch`(기본, 라이브) / `wayback`(아카이브) |
 | `--scripts` | 클라이언트 코드(.js/.json/.map)만 |
-| `--only-findings` | scan 의 critical/high URL만 |
+| `--only-findings` | 규칙 기준 critical/high URL만 (과거 기록이라 한 단계 낮아진 후보 포함) |
 | `--confidence` | 이 confidence 이상만 (기본 high) |
 | `--assets`, `-a` | collect JSONL (생략 시 최신) |
 | `--findings`, `-f` | scan JSONL (생략 시 최신) |
@@ -155,6 +179,7 @@ collect → scan 을 한 번에 수행한다. `--probe`를 붙이면 probe까지
 ```bash
 exposure-lens run --all-enabled
 exposure-lens run --org snu --probe
+exposure-lens run --all-enabled --resume   # 끊긴 단계(collect 또는 scan)부터
 ```
 
 ### 기관별 순차 실행
@@ -165,8 +190,10 @@ exposure-lens run --org snu --probe
 bash run_by_org.sh                 # collect + scan
 DO_PROBE=1 bash run_by_org.sh      # probe 까지
 ONLY="snu kaist" bash run_by_org.sh
-RESUME=1 bash run_by_org.sh        # 끝난 기관 건너뛰고 이어서
+RESUME=1 bash run_by_org.sh        # 끝난 기관 건너뛰고, 끊긴 기관은 끊긴 곳부터
 ```
+
+네트워크 끊김(exit 3)이면 남은 기관을 헛돌지 않고 그 자리에서 멈춘다. 복구 후 `RESUME=1`로 다시 실행하면 그 기관의 끊긴 단계(`collect --resume` 또는 `scan --resume`)부터 이어간다.
 
 환경변수: `CONFIG`(기본 config), `OUT_ROOT`(runs), `PAUSE`(30), `MIN_SEV`(low), `DO_PROBE`(0), `RESUME`(0), `ONLY`.
 
@@ -223,7 +250,19 @@ exposure-lens scan --all-enabled
 
 ### 값의 의미
 
-- severity: `critical` > `high` > `medium` > `low`
+- severity: 이름이 얼마나 위험해 보이는지가 아니라 **증거가 얼마나 강한지**로 매긴다
+
+| severity | 기준 | 예 |
+| --- | --- | --- |
+| `critical` | 실제로 쓸 수 있는 값을 봄, 또는 시크릿 파일·DB 포트가 **지금** 관측됨 | AKIA 키, 비밀번호 든 DB URI, 개인키, 현재 `/.env`, 열린 3306 |
+| `high` | 민감 파일·경로가 **지금** 관측됨, 또는 probe가 인증 없는 2xx 확인 | 현재 `/.git/config`, `db.sql`, `index.php.bak`, `www_backup.zip` |
+| `medium` | probe로 확인해야 할 **후보** | 해석되는 `git.`·`dev.` 호스트, Wayback에만 있는 `/.git/` |
+| `low` | 노출이 아닌 공격면 정보 | `/admin` 경로, 죽은 호스트, 공개 브라우저 키 |
+
+  - Wayback에만 있는 경로는 한 단계 낮춘다(과거 흔적). 단 URL에 박힌 시크릿은 아카이브에서 누구나 읽을 수 있으므로 낮추지 않는다
+  - probe가 라이브로 확인하면 규칙 본래 등급으로 되돌린다. 이름 기반 호스트는 예외(로그인 페이지도 2xx를 준다)
+  - 일반 `.zip` 다운로드는 백업으로 보지 않는다. 파일명에 `backup`·`db`·`www`·`src` 등이 있거나 `/backup/` 아래일 때만
+  - 같은 경로의 쿼리 변형(`?page=1`, `?page=2`…)은 한 건으로 묶고 `(+N query variants)`로 표시
 - confidence(apex 소유 확신도): `high`(seed 일치 또는 인증서 지배) / `medium`(TLD 클래스 일치) / `low`. 이름 기반 호스트 finding은 medium 후보로 제한되고, probe 가 실제 응답을 확인해야 상향된다
 - freshness: `current`(현재) / `archived`(과거)
 - 시크릿 값은 마스킹되어 저장된다(`AIza****fe`). 라우트·주소·설정 값은 그대로 저장된다
@@ -256,7 +295,7 @@ finding(scan/probe):
 ```
 src/exposure_lens/
   cli.py            명령 처리 + 단계 오케스트레이션
-  core/             config, models, net(레이트리밋 HTTP)
+  core/             config, models, net(레이트리밋 HTTP), progress(--resume 상태)
   sources/          crtsh, wayback, urlscan, shodan, cymru, body
   collect/          collector, resolve, merge, discovery, tldclass
   scan/             rules, scanner, services          (passive)

@@ -9,7 +9,7 @@ from exposure_lens.core import net
 
 def _http(**kw):
     base = dict(user_agent="t", interval=0, timeout=1, max_retries=3,
-                max_bytes=1000, max_requests=100, retry_backoff=0)
+                max_bytes=1000, max_requests=100, retry_delays=(0,))
     base.update(kw)
     return net.Http(**base)
 
@@ -122,3 +122,77 @@ def test_body_cap_is_separate_from_response_cap():
     assert h.max_body_bytes == 100
     # A body cap can never exceed the response cap.
     assert _http(max_bytes=100, max_body_bytes=9999).max_body_bytes == 100
+
+
+def test_retry_waits_climb_5_15_30(monkeypatch):
+    waits = []
+
+    def fake_urlopen(req, timeout):
+        raise _http_error(503)
+
+    monkeypatch.setattr(net, "urlopen", fake_urlopen)
+    monkeypatch.setattr(net.time, "sleep", waits.append)
+    h = _http(retry_delays=net.DEFAULT_RETRY_DELAYS)
+    with pytest.raises(urllib.error.HTTPError):
+        h.get_bytes("https://crt.sh/x")
+    assert waits == [5.0, 15.0, 30.0]
+
+
+def test_retry_past_the_ladder_reuses_its_last_rung():
+    h = _http(retry_delays=(5, 15))
+    assert [h.retry_delay(a) for a in range(4)] == [5, 15, 15, 15]
+
+
+def _refused(req, timeout):
+    raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+
+def test_network_down_after_consecutive_connect_failures(monkeypatch):
+    monkeypatch.setattr(net, "urlopen", _refused)
+    monkeypatch.setattr(net.time, "sleep", lambda s: None)
+    h = _http(max_retries=0, down_after=3)
+    for host in ("crt.sh", "web.archive.org"):  # different hosts still add up
+        with pytest.raises(urllib.error.URLError):
+            h.get_bytes(f"https://{host}/x")
+    with pytest.raises(net.NetworkDown):
+        h.get_bytes("https://urlscan.io/x")
+    assert h.connect_failure_total == 3
+
+
+def test_server_answer_or_slow_query_is_not_network_down(monkeypatch):
+    """A 502 proves the link works; a read timeout is crt.sh being slow."""
+    errors = iter([
+        urllib.error.URLError(ConnectionRefusedError("refused")),
+        _http_error(502),
+        urllib.error.URLError(ConnectionRefusedError("refused")),
+        TimeoutError("read timed out"),
+        urllib.error.URLError(ConnectionRefusedError("refused")),
+    ])
+
+    def fake_urlopen(req, timeout):
+        raise next(errors)
+
+    monkeypatch.setattr(net, "urlopen", fake_urlopen)
+    h = _http(max_retries=0, down_after=2)
+    for _ in range(5):
+        with pytest.raises((urllib.error.URLError, TimeoutError)):
+            h.get_bytes("https://crt.sh/x")
+    assert h.connect_failure_total == 3  # counted, but never 2 in a row
+
+
+def test_success_resets_the_connect_failure_streak(monkeypatch):
+    results = iter([_refused, _refused, None, _refused, _refused])
+
+    def fake_urlopen(req, timeout):
+        fn = next(results)
+        if fn is None:
+            return _Resp()
+        return fn(req, timeout)
+
+    monkeypatch.setattr(net, "urlopen", fake_urlopen)
+    h = _http(max_retries=0, down_after=3)
+    for _ in range(5):
+        try:
+            h.get_bytes("https://crt.sh/x")
+        except urllib.error.URLError:
+            pass  # never NetworkDown: the success in the middle reset it

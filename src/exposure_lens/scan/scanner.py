@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
+from dataclasses import replace
 from typing import Iterable
 from urllib.parse import urlsplit
 
@@ -139,6 +140,10 @@ def scan_assets(
     limit = SEVERITY_ORDER[min_severity]
     findings: list[Finding] = []
     seen: set[tuple[str, str, str]] = set()
+    # (org, host, rule, path) -> index into findings. One archived page crawled
+    # with 40 query strings is one path, not 40 findings.
+    path_rows: dict[tuple[str, str, str, str], int] = {}
+    variants: Counter[int] = Counter()
 
     for asset in assets:
         asset_type = asset.get("asset_type", "")
@@ -162,11 +167,21 @@ def scan_assets(
                     matches.append((rule.id, rule.category, sev, ev, host_url, "/"))
         elif asset_type == "endpoint" and url:
             path = urlsplit(url).path
+            # Only Wayback knows this URL: it existed once, which is a lead for
+            # `probe`, not a file seen today. One notch down, like a dead host.
+            archived = asset.get("freshness") == "archived"
+            best: dict[str, tuple[str, str, str, str, str, str]] = {}
             for rule in PATH_RULES:
-                if rule.pattern.search(path):
-                    matches.append(
-                        (rule.id, rule.category, rule.severity, path, url, path)
-                    )
+                if not rule.pattern.search(path):
+                    continue
+                sev = downgrade(rule.severity) if archived else rule.severity
+                prev = best.get(rule.category)
+                # One row per kind per URL: /backups/x.tgz is a backup archive,
+                # not also a separate "backup directory" finding.
+                if prev is None or SEVERITY_ORDER[sev] < SEVERITY_ORDER[prev[2]]:
+                    ev = f"{path} (archived)" if archived else path
+                    best[rule.category] = (rule.id, rule.category, sev, ev, url, path)
+            matches.extend(best.values())
             for rule in SECRET_RULES:
                 found = rule.pattern.search(url)
                 if found and is_credible_secret(rule.id, found.group(0)):
@@ -182,6 +197,12 @@ def scan_assets(
             if key in seen:
                 continue
             seen.add(key)
+            if rule_id.startswith("path-"):
+                pkey = (asset.get("org_id", ""), host, rule_id, hit_path)
+                if pkey in path_rows:
+                    variants[path_rows[pkey]] += 1
+                    continue
+                path_rows[pkey] = len(findings)
             findings.append(
                 Finding(
                     finding_id=f"F_{run_date()}_{len(findings) + 1:06d}",
@@ -200,6 +221,10 @@ def scan_assets(
                 )
             )
 
+    for i, extra in variants.items():
+        findings[i] = replace(
+            findings[i], evidence=f"{findings[i].evidence} (+{extra} query variants)"
+        )
     findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
     return findings
 

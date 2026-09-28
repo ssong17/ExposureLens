@@ -13,6 +13,7 @@ CONFIG = """
 [collector]
 request_interval_seconds = 0
 max_requests = 50
+org_pause_seconds = 0
 
 [[orgs]]
 org_id = "x"
@@ -188,3 +189,92 @@ def test_validate_reports_enabled_count(tmp_path, capsys):
     cli.main(["validate", "-i", _config(tmp_path)])
     assert "1 enabled" in capsys.readouterr().out
 
+
+
+# ---- resume ------------------------------------------------------------------
+
+def test_network_down_stops_and_resume_continues(tmp_path, no_network, monkeypatch,
+                                                 capsys):
+    from exposure_lens.core.net import NetworkDown
+
+    def down_on_y(http, org, collector, **kw):
+        no_network.append(org.org_id)
+        if org.org_id == "y":
+            raise NetworkDown("3 requests in a row failed to connect")
+        return [_asset(f"a.{org.org_id}.com", org=org.org_id)], []
+
+    monkeypatch.setattr(cli, "collect_org", down_on_y)
+    config = _config(tmp_path, ORG_B)
+    out = tmp_path / "out"
+    code = cli.main(["collect", "-i", config, "--all-enabled", "-o", str(out), "-q"])
+    assert code == cli.EXIT_NETWORK_DOWN
+    assert list(out.glob("*/*_collect.progress.json"))  # resumable
+
+    # Link is back: --resume collects only the org that broke off.
+    no_network.clear()
+    monkeypatch.setattr(
+        cli, "collect_org",
+        lambda http, org, collector, **kw: (
+            no_network.append(org.org_id)
+            or ([_asset(f"a.{org.org_id}.com", org=org.org_id)], [])
+        ),
+    )
+    code = cli.main(
+        ["collect", "-i", config, "--all-enabled", "-o", str(out), "-q", "--resume"]
+    )
+    capsys.readouterr()
+    assert code == 0
+    assert no_network == ["y"]
+    files = list(out.glob("*/*_collect.jsonl"))
+    assert len(files) == 1  # same run continued, not a second file
+    assert {r["host"] for r in read_jsonl(files[0])} == {"a.x.com", "a.y.com"}
+    assert not list(out.glob("*/*.progress.json"))  # finished: nothing to resume
+
+
+def test_resume_with_nothing_to_resume_is_an_error(tmp_path, no_network, capsys):
+    code = cli.main([
+        "collect", "-i", _config(tmp_path), "--all-enabled",
+        "-o", str(tmp_path / "out"), "-q", "--resume",
+    ])
+    assert code == 2
+    assert "--resume 없이" in capsys.readouterr().err
+
+
+def test_scan_resume_only_asks_shodan_for_the_rest(tmp_path, no_network, monkeypatch,
+                                                   capsys):
+    from exposure_lens.core.net import NetworkDown
+    from exposure_lens.scan import services
+
+    config = _config(tmp_path)
+    out = tmp_path / "out"
+    rows = [
+        {**_asset("a.x.com").to_dict(), "resolved_ip": "1.1.1.1"},
+        {**_asset("b.x.com").to_dict(), "resolved_ip": "2.2.2.2"},
+    ]
+    (out / "20260101").mkdir(parents=True)
+    assets_path = out / "20260101" / "000000_collect.jsonl"
+    assets_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+    asked = []
+
+    def flaky(http, ip):
+        asked.append(ip)
+        if ip == "2.2.2.2":
+            raise NetworkDown("down")
+        return {"ports": [3306]}
+
+    monkeypatch.setattr(cli, "check_exposure", services.check_exposure)
+    monkeypatch.setattr(services.shodan, "internetdb", flaky)
+    args = ["scan", "-i", config, "-o", str(out), "-q", "--min-severity", "low"]
+    assert cli.main(args) == cli.EXIT_NETWORK_DOWN
+    assert not list(out.glob("*/*_scan.jsonl"))  # an unfinished scan is not "done"
+
+    asked.clear()
+    monkeypatch.setattr(services.shodan, "internetdb", lambda http, ip: (
+        asked.append(ip) or {"ports": [6379]}))
+    assert cli.main([*args, "--resume"]) == 0
+    capsys.readouterr()
+    assert asked == ["2.2.2.2"]
+    scan = read_jsonl(next(out.glob("*/*_scan.jsonl")))
+    assert {f["rule"] for f in scan} >= {"port-3306", "port-6379"}
+    assert not list(out.glob("*/*.progress.jsonl"))

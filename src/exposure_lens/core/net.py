@@ -30,6 +30,25 @@ class RequestBudgetExceeded(RuntimeError):
     """Raised when the configured request cap is reached."""
 
 
+class NetworkDown(RuntimeError):
+    """Raised after several requests in a row failed to connect at all.
+
+    One unreachable index is a source error, recorded and skipped. Every request
+    failing — regardless of host — means OUR connection is gone, and carrying on
+    would mark every remaining org/IP as "collected, nothing found". Stopping
+    lets the stage checkpoint and a ``--resume`` run pick up where it broke.
+    """
+
+
+# Waits before each retry of a transient failure (seconds). Index outages last
+# tens of seconds, not a couple, so the ladder climbs quickly: 5 -> 15 -> 30.
+DEFAULT_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 30.0)
+
+# Requests in a row (each after exhausting its retries) that failed to connect
+# before the network is declared down.
+DEFAULT_DOWN_AFTER = 3
+
+
 # Transient server/network responses worth retrying (crt.sh returns 502/503
 # constantly). A 404 is NOT here: it means "no results", so retrying is pointless.
 _TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
@@ -52,6 +71,16 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def _is_connect_failure(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return False
+    if isinstance(exc, ConnectionError):
+        return True
+    if isinstance(exc, URLError):
+        return not isinstance(exc.reason, TimeoutError)
+    return False
+
+
 def request_host(url: str) -> str:
     """Throttle bucket for a URL: its hostname, lowercased ('' when unparseable)."""
     return (urlsplit(url).hostname or "").lower()
@@ -68,7 +97,8 @@ class Http:
         max_bytes: int,
         max_requests: int,
         max_body_bytes: int | None = None,
-        retry_backoff: float = 2.0,
+        retry_delays: "tuple[float, ...] | list[float]" = DEFAULT_RETRY_DELAYS,
+        down_after: int = DEFAULT_DOWN_AFTER,
         cache_entries: int = DEFAULT_CACHE_ENTRIES,
         on_retry: "Callable[[str], None] | None" = None,
     ) -> None:
@@ -82,7 +112,13 @@ class Http:
         # regex over a multi-megabyte bundle costs more than it finds.
         self.max_body_bytes = min(max_body_bytes or max_bytes, max_bytes)
         self.max_requests = max_requests
-        self.retry_backoff = retry_backoff
+        self.retry_delays = tuple(retry_delays) or (0.0,)
+        self.down_after = down_after
+        self._connect_failures = 0  # consecutive calls that never connected
+        # Every call that never connected, ever. Callers compare it before and
+        # after a unit of work to tell "done, nothing found" from "the link
+        # dropped while doing it" (which must be redone on resume).
+        self.connect_failure_total = 0
         self.cache_entries = max(0, cache_entries)
         self._on_retry = on_retry
         self.request_count = 0
@@ -103,6 +139,7 @@ class Http:
                     body = response.read(self.max_bytes + 1)
                     if len(body) > self.max_bytes:
                         raise ValueError("response exceeds size cap")
+                    self._connect_failures = 0
                     return body, response.headers.get("Content-Type", "")
             except ValueError:
                 raise  # size cap breach: a real error, not worth retrying
@@ -110,14 +147,14 @@ class Http:
                 last = exc
                 if exc.code not in _TRANSIENT_STATUS or attempt >= self.max_retries:
                     break  # 404 etc., or out of retries
-            except (URLError, TimeoutError) as exc:
-                last = exc  # transient network failure
+            except (URLError, TimeoutError, ConnectionError) as exc:
+                last = exc  # transient network failure (incl. reset mid-read)
                 if attempt >= self.max_retries:
                     break
-            # Transient failure with retries left: wait (exponential) and retry
-            # the SAME query instead of skipping it, so a crt.sh 502 blip does
-            # not silently drop coverage.
-            delay = self.retry_backoff * (2 ** attempt)
+            # Transient failure with retries left: wait and retry the SAME query
+            # instead of skipping it, so a crt.sh 502 blip does not silently
+            # drop coverage.
+            delay = self.retry_delay(attempt)
             if self._on_retry:
                 self._on_retry(
                     f"retry {attempt + 1}/{self.max_retries} after {delay:.0f}s "
@@ -125,7 +162,31 @@ class Http:
                 )
             time.sleep(delay)
         assert last is not None
+        self._note_failure(last)
         raise last
+
+    def retry_delay(self, attempt: int) -> float:
+        """Wait before retry ``attempt + 1``; past the ladder, its last rung."""
+        return self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
+
+    def _note_failure(self, exc: Exception) -> None:
+        """Count calls that never reached a server; raise when the link is gone.
+
+        Only a failure to CONNECT counts (DNS failure, refused, unreachable,
+        reset). An HTTPError (502, 429, 404) is a server that answered, and a
+        read timeout is usually crt.sh being slow on a big query — neither says
+        our link is down, so both reset the count just like a success does.
+        """
+        if not _is_connect_failure(exc):
+            self._connect_failures = 0
+            return
+        self._connect_failures += 1
+        self.connect_failure_total += 1
+        if self.down_after and self._connect_failures >= self.down_after:
+            raise NetworkDown(
+                f"{self._connect_failures} requests in a row failed to connect "
+                f"(last: {exc})"
+            ) from exc
 
     def get_text(self, url: str, *, limit: int | None = None) -> tuple[str, str]:
         """Fetch a body as decoded text plus its Content-Type (uncached).

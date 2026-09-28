@@ -43,7 +43,7 @@ from ..core.models import (
 )
 from ..core.net import Http, RequestBudgetExceeded
 from ..sources import body as body_src
-from ..scan.rules import AUTHZ_PATH
+from ..scan.rules import AUTHZ_PATH, base_severity
 from ..scan.scanner import scan_body
 from .verify import make_liveness_finding, verify_findings
 
@@ -291,7 +291,9 @@ def run_inspection(
     if only_findings:
         finding_urls = {
             f.get("url", "") for f in prior_findings
-            if f.get("url") and f.get("severity") in ("critical", "high")
+            # base_severity: an archived .git path scanned as a medium
+            # candidate is exactly what this pass exists to check.
+            if f.get("url") and base_severity(f) in ("critical", "high")
         }
 
     # 1) endpoint bodies -> secrets/config/DB/PII/JS/authz (+ liveness in fetch)

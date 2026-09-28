@@ -25,7 +25,7 @@ from ..core.models import (
     run_date,
     timestamp_now,
 )
-from ..core.net import Http, RequestBudgetExceeded
+from ..core.net import Http, NetworkDown, RequestBudgetExceeded
 from ..sources import shodan
 from .rules import RISKY_PORTS
 
@@ -95,8 +95,17 @@ def check_exposure(
     min_severity: str = "medium",
     max_ips: int = 0,  # 0 = 무제한
     log: Callable[[str], None] | None = None,
+    answers: dict[str, dict | None] | None = None,
+    on_answer: Callable[[str, dict | None], None] | None = None,
 ) -> tuple[list[Finding], list[str]]:
-    """Return (findings, problems) from InternetDB records for the given IPs."""
+    """Return (findings, problems) from InternetDB records for the given IPs.
+
+    ``answers`` are records an interrupted run already fetched (ip -> record,
+    None = no data); those IPs are not queried again. ``on_answer`` is told
+    every new answer so the caller can persist it. An IP whose query failed is
+    reported in problems and NOT passed to ``on_answer``, so a resume retries
+    it. ``NetworkDown`` propagates.
+    """
     say = log or (lambda _: None)
     limit = SEVERITY_ORDER[min_severity]
     findings: list[Finding] = []
@@ -107,8 +116,14 @@ def check_exposure(
         problems.append(f"capped IPs {max_ips}/{len(ips)}")
         ips = ips[:max_ips]
 
-    say(f"querying Shodan InternetDB for {len(ips)} IPs...")
+    answers = answers or {}
+    reused = sum(1 for ip in ips if ip in answers)
+    say(
+        f"querying Shodan InternetDB for {len(ips) - reused} IPs"
+        + (f" ({reused} reused from the interrupted run)..." if reused else "...")
+    )
     shared_count = 0
+    failed: list[str] = []
 
     def _add(info: IpInfo, severity: str, rule: str, label: str, port: int) -> None:
         nonlocal shared_count
@@ -147,14 +162,25 @@ def check_exposure(
         )
 
     for i, ip in enumerate(ips, 1):
-        if http.max_requests and http.request_count >= http.max_requests:
-            problems.append("stopped at request cap")
-            break
-        try:
-            data = shodan.internetdb(http, ip)
-        except RequestBudgetExceeded:
-            problems.append("stopped at request cap")
-            break
+        if ip in answers:
+            data = answers[ip]
+        else:
+            if http.max_requests and http.request_count >= http.max_requests:
+                problems.append("stopped at request cap")
+                break
+            try:
+                data = shodan.internetdb(http, ip)
+            except NetworkDown:
+                raise
+            except RequestBudgetExceeded:
+                problems.append("stopped at request cap")
+                break
+            except Exception as exc:  # noqa: BLE001 - one IP failing is not fatal
+                failed.append(ip)
+                say(f"  ({i}/{len(ips)}) {ip}: query failed ({exc})")
+                continue
+            if on_answer:
+                on_answer(ip, data)
         if not data:
             continue
         # Only report OPEN PORTS — a fact Shodan actually observed. InternetDB's
@@ -168,6 +194,11 @@ def check_exposure(
                 severity, label = spec
                 _add(ip_index[ip], severity, f"port-{port}", label, port)
 
+    if failed:
+        problems.append(
+            f"Shodan 조회 실패 {len(failed)}개 IP (결과 없음으로 취급하지 않음): "
+            f"{', '.join(failed[:10])}{' ...' if len(failed) > 10 else ''}"
+        )
     if shared_count:
         problems.append(
             f"{shared_count} service findings sit on shared/CDN addresses and were "

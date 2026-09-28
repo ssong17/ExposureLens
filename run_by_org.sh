@@ -1,23 +1,17 @@
 #!/usr/bin/env bash
-# 기관별로 나눠 순차 실행 + 기관 사이 휴식.
+# 기관별 순차 실행. 기관마다 프로세스를 새로 띄우고(요청 예산 리셋), 출력 디렉토리를
+# runs/<org>/ 로 분리하고, 기관 사이에 PAUSE 초 쉰다.
 #
-# 왜 기관별로 나누나:
-#   - 기관마다 exposure-lens 프로세스를 새로 띄우므로 요청 예산(max_requests)이
-#     기관마다 리셋된다. --all-enabled 한 번이면 100개 기관이 예산 1000개를
-#     나눠 쓰다가 뒤쪽 기관이 굶지만, 나눠 돌리면 각자 온전한 예산을 쓴다.
-#   - 기관마다 --output 을 분리해 collect.jsonl / scan.jsonl 이 섞이지 않는다.
-#   - 기관 사이에 쉬어서 공개 색인·대상 서버 부담을 낮춘다.
+# 사용:
+#   bash run_by_org.sh                       collect + scan
+#   DO_PROBE=1 bash run_by_org.sh            probe 까지 (대상에 라이브 GET)
+#   ONLY="hancom truen" bash run_by_org.sh   지정 기관만
+#   RESUME=1 bash run_by_org.sh              끝난 기관 건너뛰고, 끊긴 기관은 끊긴 곳부터
 #
-# 사용법:
-#   bash run_by_org.sh                 # collect + scan, 기관 사이 30초 휴식
-#   PAUSE=60 bash run_by_org.sh        # 휴식 60초
-#   DO_PROBE=1 bash run_by_org.sh      # active probe 까지 (대상에 라이브 GET!)
-#   RESUME=1 bash run_by_org.sh        # 이미 끝난 기관은 건너뛰고 이어서
-#   ONLY="hancom truen" bash run_by_org.sh   # 이 기관들만
+# 네트워크가 끊기면(exit 3) 거기서 멈춘다. 복구 후 RESUME=1 로 다시 실행.
 #
-# 환경변수(기본값):
-#   CONFIG=config  OUT_ROOT=runs  PAUSE=30  MIN_SEV=low
-#   DO_PROBE=0  RESUME=0  ONLY=""
+# 환경변수: CONFIG(config) OUT_ROOT(runs) PAUSE(30) MIN_SEV(low)
+#           DO_PROBE(0) RESUME(0) ONLY("")
 set -u
 
 CONFIG="${CONFIG:-config}"
@@ -28,7 +22,7 @@ DO_PROBE="${DO_PROBE:-0}"
 RESUME="${RESUME:-0}"
 ONLY="${ONLY:-}"
 
-# 파이썬 인터프리터 자동 선택 (python / python3).
+# 파이썬 인터프리터: python 우선, 없으면 python3.
 if command -v python >/dev/null 2>&1; then
   PY="python"
 elif command -v python3 >/dev/null 2>&1; then
@@ -45,7 +39,7 @@ else
   export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
-# 실행할 기관 목록: ONLY 가 있으면 그것, 없으면 config 의 enabled 전부.
+# 대상 기관: ONLY 가 있으면 그 목록, 없으면 config 의 enabled 전부.
 if [ -n "$ONLY" ]; then
   orgs="$ONLY"
 else
@@ -68,29 +62,58 @@ echo
 i=0
 done_ok=0
 failed=""
+
+# 네트워크 끊김(exit 3): 남은 기관을 헛돌지 않고 멈춘다. 진행 파일이 남아 있어
+# RESUME=1 로 다시 돌리면 이 기관의 끊긴 지점부터 이어서 한다.
+network_down() {
+  echo
+  echo "======================================"
+  echo "네트워크 끊김으로 중단: $1 ($i/$total)"
+  echo "연결 복구 후 이어서 실행:  RESUME=1 bash run_by_org.sh"
+  exit 3
+}
 for org in $orgs; do
   i=$((i + 1))
   out="$OUT_ROOT/$org"
   printf '==== [%d/%d] %s ====\n' "$i" "$total" "$org"
 
-  # RESUME: 이미 scan 결과가 있으면 건너뛴다.
-  if [ "$RESUME" = "1" ] && ls "$out"/*/scan.jsonl >/dev/null 2>&1; then
-    echo "  이미 완료 → 건너뜀"
-    done_ok=$((done_ok + 1))
-    continue
+  # RESUME: 끝난 기관은 건너뛰고, 중단된 단계는 --resume 으로 끊긴 곳부터.
+  collect_args=""
+  scan_args=""
+  skip_collect=0
+  if [ "$RESUME" = "1" ]; then
+    if ls "$out"/*/*_scan.progress.jsonl >/dev/null 2>&1; then
+      echo "  scan 중단 지점부터 이어서"
+      skip_collect=1
+      scan_args="--resume"
+    elif ls "$out"/*/*_collect.progress.json >/dev/null 2>&1; then
+      echo "  collect 중단 지점부터 이어서"
+      collect_args="--resume"
+    elif ls "$out"/*/*_scan.jsonl >/dev/null 2>&1; then
+      echo "  이미 완료 → 건너뜀"
+      done_ok=$((done_ok + 1))
+      continue
+    fi
   fi
 
   ok=1
-  # 1) 수집 (대상 무접촉)
-  $EL collect --org "$org" -o "$out" -i "$CONFIG" || { echo "  collect 실패"; ok=0; }
-
-  # 2) passive 검사 (대상 무접촉). collect 가 성공했을 때만.
-  if [ "$ok" = "1" ]; then
-    $EL scan -o "$out" -i "$CONFIG" --min-severity "$MIN_SEV" \
-      || { echo "  scan 실패"; ok=0; }
+  # 수집 (대상 무접촉)
+  if [ "$skip_collect" = "0" ]; then
+    $EL collect --org "$org" -o "$out" -i "$CONFIG" $collect_args
+    rc=$?
+    [ "$rc" = "3" ] && { network_down "$org"; }
+    [ "$rc" != "0" ] && { echo "  collect 실패"; ok=0; }
   fi
 
-  # 3) active 검사 (대상에 라이브 GET). DO_PROBE=1 일 때만.
+  # passive 검사 (대상 무접촉). collect 성공 시에만.
+  if [ "$ok" = "1" ]; then
+    $EL scan -o "$out" -i "$CONFIG" --min-severity "$MIN_SEV" $scan_args
+    rc=$?
+    [ "$rc" = "3" ] && { network_down "$org"; }
+    [ "$rc" != "0" ] && { echo "  scan 실패"; ok=0; }
+  fi
+
+  # active 검사 (대상에 라이브 GET). DO_PROBE=1 일 때만.
   if [ "$ok" = "1" ] && [ "$DO_PROBE" = "1" ]; then
     $EL probe -o "$out" -i "$CONFIG" --min-severity "$MIN_SEV" \
       || echo "  probe 실패(계속)"

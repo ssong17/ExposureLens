@@ -30,7 +30,15 @@ from .core.models import (
     run_date,
     run_time,
 )
-from .core.net import Http
+from .core.net import Http, NetworkDown
+from .core.progress import (
+    COLLECT_SUFFIX,
+    SCAN_SUFFIX,
+    CollectProgress,
+    ScanProgress,
+    find_latest,
+    stamp_of,
+)
 from .report.output import (
     read_jsonl,
     write_jsonl,
@@ -54,6 +62,11 @@ def _default_config() -> str:
 
 
 DEFAULT_CONFIG = _default_config()
+
+# Exit code when a stage stopped because our connection dropped. Distinct from
+# 2 (bad config/input) so a wrapper script can stop and tell the operator to
+# rerun with --resume instead of marching on through every remaining org.
+EXIT_NETWORK_DOWN = 3
 
 
 def _latest_output(output_root: str, stage: str) -> str:
@@ -97,6 +110,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", "-o", default="output", help="output root directory")
     parser.add_argument(
         "--quiet", "-q", action="store_true", help="suppress progress logs"
+    )
+
+
+def _add_resume(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="continue the newest run that broke off (network drop, Ctrl-C) "
+        "from where it stopped, instead of starting over",
     )
 
 
@@ -163,6 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-severity", choices=list(SEVERITY_LEVELS), default="medium",
         help="lowest severity to report (default: medium)",
     )
+    _add_resume(run)
     _add_common(run)
 
     apex = sub.add_parser(
@@ -189,6 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
         "to accumulate (dedup), because crt.sh/Wayback fail differently every "
         "run and the union of a few runs is the real coverage",
     )
+    _add_resume(collect)
     _add_common(collect)
 
     # scan = offline host/URL rules + current services (Shodan). No request to
@@ -211,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-services", action="store_true",
         help="skip the Shodan current-services check (pure offline rules)",
     )
+    _add_resume(scan)
     _add_common(scan)
 
     # probe = the active stage: live GET to the target.
@@ -256,7 +280,7 @@ def _make_http(app: AppConfig, *, quiet: bool = False) -> Http:
         interval=c.request_interval_seconds,
         timeout=c.timeout_seconds,
         max_retries=c.max_retries,
-        retry_backoff=c.retry_backoff_seconds,
+        retry_delays=c.retry_delays_seconds,
         max_bytes=c.max_response_bytes,
         max_body_bytes=c.max_body_bytes,
         max_requests=c.max_requests,
@@ -271,17 +295,42 @@ def _logger(quiet: bool):
     return lambda m: print(m, file=sys.stderr, flush=True)
 
 
-def _report(out_dir: Path, http: Http | None, problems: list[str]) -> int:
+def _report(
+    out_dir: Path, http: Http | None, problems: list[str], *, code: int = 0
+) -> int:
     reqs = f"requests {http.request_count} - " if http else ""
     print(f"\n{reqs}output {out_dir}")
     for p in problems:
         print(f"warning: {p}", file=sys.stderr)
-    return 0
+    if code == EXIT_NETWORK_DOWN:
+        print(
+            "stopped: network down. Rerun the same command with --resume to "
+            "continue from where it stopped.",
+            file=sys.stderr,
+        )
+    return code
 
 
 def _out_dir(args: argparse.Namespace) -> Path:
     path = Path(args.output) / run_date()
     path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _adopt(args: argparse.Namespace, progress_path: Path, suffix: str) -> Path:
+    """Continue a broken-off run: reuse its time stamp and date directory, so
+    the resumed output overwrites that run's files instead of starting new ones."""
+    args._stamp = stamp_of(progress_path, suffix)
+    return progress_path.parent
+
+
+def _resume_path(args: argparse.Namespace, suffix: str, stage: str) -> Path:
+    path = find_latest(args.output, suffix)
+    if path is None:
+        raise ValueError(
+            f"이어서 실행할 {stage} 작업이 {args.output}/ 아래에 없습니다 "
+            f"(중단된 실행이 없음). --resume 없이 실행하세요."
+        )
     return path
 
 
@@ -321,40 +370,83 @@ def _run_discover_apex(app: AppConfig, args: argparse.Namespace) -> int:
 
 
 def _collect_stage(
-    app: AppConfig, args: argparse.Namespace, http: Http, out_path: Path,
-) -> tuple[list[dict], list[str]]:
+    app: AppConfig, args: argparse.Namespace, http: Http, out_dir: Path,
+) -> tuple[list[dict], list[str], bool]:
     """Collect every selected org, accumulating and checkpointing as we go.
 
-    Accumulate by default (public indexes fail differently each run, so the
-    union is the real coverage; ``--fresh`` opts out). Checkpoint after every
-    org, and rest ``org_pause_seconds`` between orgs — sequential-with-rest is
-    what replaced the request cap, so a full run finishes without hammering the
-    free-tier indexes into rate-limiting.
+    Returns (assets, problems, network_down). Accumulate by default (public
+    indexes fail differently each run, so the union is the real coverage;
+    ``--fresh`` opts out). Two checkpoints are kept: the collect JSONL after
+    every org, and a progress file after every apex, which ``--resume`` reads to
+    skip finished orgs/apexes. Rest ``org_pause_seconds`` between orgs —
+    sequential-with-rest is what replaced the request cap, so a full run
+    finishes without hammering the free-tier indexes into rate-limiting.
     """
     log = _logger(args.quiet)
+    say = log or (lambda _: None)
     pause = app.collector.org_pause_seconds
-    accumulated: list[dict] = []
-    if not args.fresh:
-        try:
-            accumulated = read_jsonl(_latest_output(args.output, "collect"))
-        except ValueError:
-            accumulated = []
-    started_with = len(accumulated)
-    collected = 0
+    out_path = _f(out_dir, args, "collect.jsonl")
+    progress_path = _f(out_dir, args, "collect.progress.json")
     problems: list[str] = []
 
-    orgs = _select(app, args)
-    for i, org in enumerate(orgs, 1):
-        assets, org_problems = collect_org(
-            http, org, app.collector,
-            resolve=not args.no_resolve,
-            endpoints=not args.no_endpoints,
-            log=log,
+    if getattr(args, "resume", False) and progress_path.exists():
+        progress = CollectProgress.load(progress_path)
+        source = out_path if out_path.exists() else Path(progress.base or out_path)
+        accumulated = read_jsonl(source) if source.exists() else []
+        started_with = 0
+        say(
+            f"이어서 수집: 완료 {len(progress.orgs_done)}개 기관 건너뜀, "
+            f"진행 중이던 {len(progress.partial)}개 기관은 끊긴 곳부터"
         )
+    else:
+        accumulated = []
+        base = ""
+        if not args.fresh:
+            try:
+                base = _latest_output(args.output, "collect")
+                accumulated = read_jsonl(base)
+            except ValueError:
+                accumulated = []
+        progress = CollectProgress(progress_path, base=base)
+        progress.save()
+        started_with = len(accumulated)
+    collected = 0
+    down = False
+    first = True
+
+    orgs = _select(app, args)
+    for org in orgs:
+        if org.org_id in progress.orgs_done:
+            continue
+        # Rest between orgs (not before the first one this run touches).
+        if pause > 0 and not first:
+            say(f"  다음 기관까지 {pause:.0f}s 휴식...")
+            time.sleep(pause)
+        first = False
+
+        state = progress.for_org(org.org_id)
+        try:
+            assets, org_problems = collect_org(
+                http, org, app.collector,
+                resolve=not args.no_resolve,
+                endpoints=not args.no_endpoints,
+                log=log,
+                progress=state,
+                checkpoint=progress.save,
+            )
+        except NetworkDown as exc:
+            progress.save()
+            problems.append(f"[{org.org_id}] 네트워크 끊김으로 중단: {exc}")
+            down = True
+            break
         problems.extend(org_problems)
         collected += len(assets)
         accumulated = merge_assets(accumulated, [a.to_dict() for a in assets])
         write_jsonl_atomic(accumulated, out_path)  # checkpoint after each org
+        if state.complete:
+            progress.org_done(org.org_id)
+        else:
+            progress.save()  # a step was cut off: stays resumable
 
         sub_count = sum(1 for a in assets if a.asset_type in ("apex", "subdomain"))
         ep_count = sum(1 for a in assets if a.asset_type == "endpoint")
@@ -371,36 +463,46 @@ def _collect_stage(
         if len(assets) > 20:
             print(f"  ... 외 {len(assets) - 20}건")
 
-        # Rest between orgs (not after the last).
-        if pause > 0 and i < len(orgs):
-            if log:
-                log(f"  다음 기관까지 {pause:.0f}s 휴식...")
-            time.sleep(pause)
-
+    if not down and not progress.partial:
+        progress.finish()  # nothing left to resume
+    elif not down:
+        problems.append(
+            f"연결 실패로 미완료 기관 {len(progress.partial)}개: "
+            f"{', '.join(progress.partial)} (--resume 으로 이어서)"
+        )
     if not args.fresh and started_with:
         problems.append(
             f"기존 collect에 누적: {started_with} + {collected} 수집 "
             f"-> {len(accumulated)} 고유 (--fresh 로 초기화)"
         )
-    return accumulated, problems
+    return accumulated, problems, down
 
 
 def _run_collect(app: AppConfig, args: argparse.Namespace) -> int:
     http = _make_http(app, quiet=args.quiet)
-    out_dir = _out_dir(args)
-    merged, problems = _collect_stage(app, args, http, _f(out_dir, args, "collect.jsonl"))
+    if args.resume:
+        out_dir = _adopt(args, _resume_path(args, COLLECT_SUFFIX, "collect"), COLLECT_SUFFIX)
+    else:
+        out_dir = _out_dir(args)
+    merged, problems, down = _collect_stage(app, args, http, out_dir)
 
     write_summary(
         _f(out_dir, args, "collect_summary.md"), f"collect - {run_date()}", problems,
         preamble=collect_stats_lines(merged, app.orgs), command=args._command_str,
     )
-    return _report(out_dir, http, problems)
+    return _report(out_dir, http, problems, code=EXIT_NETWORK_DOWN if down else 0)
 
 
 def _scan_stage(
     app: AppConfig, args: argparse.Namespace, assets: list[dict], http: Http | None,
+    progress: ScanProgress | None = None,
 ) -> tuple[list, list[str]]:
-    """Offline host/URL rules plus, unless disabled, current open services."""
+    """Offline host/URL rules plus, unless disabled, current open services.
+
+    ``progress`` records each Shodan answer as it arrives and supplies the ones
+    an interrupted run already got, so a resume only queries the rest. A
+    ``NetworkDown`` propagates to the caller.
+    """
     findings = scan_assets(assets, min_severity=args.min_severity)
     problems: list[str] = []
     if not args.no_services and http is not None:
@@ -412,6 +514,8 @@ def _scan_stage(
         svc, sprob = check_exposure(
             http, build_ip_index(assets),
             min_severity=args.min_severity, log=_logger(args.quiet),
+            answers=progress.answers if progress else None,
+            on_answer=progress.record if progress else None,
         )
         findings.extend(svc)
         problems.extend(sprob)
@@ -419,12 +523,34 @@ def _scan_stage(
     return findings, problems
 
 
-def _run_scan(app: AppConfig, args: argparse.Namespace) -> int:
-    assets = read_jsonl(args.assets or _latest_output(args.output, "collect"))
-    http = None if args.no_services else _make_http(app, quiet=args.quiet)
-    findings, problems = _scan_stage(app, args, assets, http)
+def _start_scan_progress(
+    args: argparse.Namespace, out_dir: Path, assets_path: str,
+) -> ScanProgress | None:
+    if args.no_services:
+        return None  # offline rules only: nothing slow to resume
+    return ScanProgress.start(_f(out_dir, args, "scan.progress.jsonl"), assets_path)
 
-    out_dir = _out_dir(args)
+
+def _run_scan(app: AppConfig, args: argparse.Namespace) -> int:
+    if args.resume:
+        path = _resume_path(args, SCAN_SUFFIX, "scan")
+        out_dir = _adopt(args, path, SCAN_SUFFIX)
+        progress = ScanProgress.load(path)
+        assets_path = args.assets or progress.assets_path
+        print(f"이어서 scan: Shodan {len(progress.answers)}개 IP 응답 재사용", file=sys.stderr)
+    else:
+        assets_path = args.assets or _latest_output(args.output, "collect")
+        out_dir = _out_dir(args)
+        progress = _start_scan_progress(args, out_dir, assets_path)
+    assets = read_jsonl(assets_path)
+    http = None if args.no_services else _make_http(app, quiet=args.quiet)
+    try:
+        findings, problems = _scan_stage(app, args, assets, http, progress)
+    except NetworkDown as exc:
+        return _report(out_dir, http, [f"scan 중단: {exc}"], code=EXIT_NETWORK_DOWN)
+    if progress:
+        progress.finish()
+
     write_jsonl(findings, _f(out_dir, args, "scan.jsonl"))
 
     counts = Counter(f.severity for f in findings)
@@ -505,17 +631,57 @@ def _run_probe(app: AppConfig, args: argparse.Namespace) -> int:
 
 
 def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
-    """collect -> scan (-> probe) in one pass, wiring stages in memory."""
-    http = _make_http(app, quiet=args.quiet)
-    out_dir = _out_dir(args)
+    """collect -> scan (-> probe) in one pass, wiring stages in memory.
 
-    asset_dicts, problems = _collect_stage(
-        app, args, http, _f(out_dir, args, "collect.jsonl")
-    )
-    print(f"collect - {len(asset_dicts)} assets")
+    ``--resume`` continues whichever stage broke off last: an unfinished
+    collect resumes and then scans; an unfinished scan skips collect entirely
+    and reuses that run's collect output.
+    """
+    http = _make_http(app, quiet=args.quiet)
+    scan_progress: ScanProgress | None = None
+    if args.resume:
+        cands = [
+            (p, suffix)
+            for p, suffix in (
+                (find_latest(args.output, COLLECT_SUFFIX), COLLECT_SUFFIX),
+                (find_latest(args.output, SCAN_SUFFIX), SCAN_SUFFIX),
+            )
+            if p is not None
+        ]
+        if not cands:
+            _resume_path(args, COLLECT_SUFFIX, "run")  # raises the "nothing" error
+        path, suffix = max(cands, key=lambda c: c[0].stat().st_mtime)
+        out_dir = _adopt(args, path, suffix)
+        if suffix == SCAN_SUFFIX:
+            scan_progress = ScanProgress.load(path)
+    else:
+        out_dir = _out_dir(args)
+
+    collect_path = _f(out_dir, args, "collect.jsonl")
+    if scan_progress is not None:
+        asset_dicts = read_jsonl(scan_progress.assets_path or collect_path)
+        problems: list[str] = []
+        print(f"collect - 완료된 결과 재사용 ({len(asset_dicts)} assets)")
+    else:
+        asset_dicts, problems, down = _collect_stage(app, args, http, out_dir)
+        if down:
+            write_summary(
+                _f(out_dir, args, "run_summary.md"), f"run - {run_date()}", problems,
+                preamble=collect_stats_lines(asset_dicts, app.orgs),
+                command=args._command_str,
+            )
+            return _report(out_dir, http, problems, code=EXIT_NETWORK_DOWN)
+        print(f"collect - {len(asset_dicts)} assets")
+        scan_progress = _start_scan_progress(args, out_dir, str(collect_path))
 
     http.clear_cache()  # index pages are done with; do not carry them further
-    findings, sproblems = _scan_stage(app, args, asset_dicts, http)
+    try:
+        findings, sproblems = _scan_stage(app, args, asset_dicts, http, scan_progress)
+    except NetworkDown as exc:
+        problems.append(f"scan 중단: {exc}")
+        return _report(out_dir, http, problems, code=EXIT_NETWORK_DOWN)
+    if scan_progress:
+        scan_progress.finish()
     problems.extend(sproblems)
     write_jsonl(findings, _f(out_dir, args, "scan.jsonl"))
     c = Counter(f.severity for f in findings)

@@ -29,7 +29,7 @@ from ..core.models import (
     timestamp_now,
 )
 from ..core.net import Http, RequestBudgetExceeded
-from ..scan.rules import VERIFY_DEFAULT_PROBE, VERIFY_PROBES
+from ..scan.rules import VERIFY_DEFAULT_PROBE, VERIFY_PROBES, base_severity
 from ..scan.scanner import scan_body
 
 
@@ -82,7 +82,9 @@ def _probe_targets(finding: dict) -> list[tuple[str, str, str, str]]:
     host = finding.get("host", "")
     url = finding.get("url", "")
     if url:  # an endpoint/path finding: confirm the exact URL it flagged
-        return [(url, finding.get("severity", "medium"),
+        # Rule level, not the scan level: a Wayback-only path was lowered as
+        # a candidate, but a live unauthenticated hit is present-tense.
+        return [(url, base_severity(finding),
                  finding.get("category", "exposure"),
                  f"verify-{finding.get('rule', 'path')}")]
     if not host:

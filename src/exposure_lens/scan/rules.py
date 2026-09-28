@@ -3,6 +3,23 @@
 Three rule sets, all matched against data already collected (never by touching
 the target): sensitive hostnames, sensitive URL paths, and secrets leaked in
 URL query strings. Patterns are deliberately high-signal to limit noise.
+
+Severity means how much evidence stands behind a finding, not how scary the
+name sounds:
+
+    critical  a usable secret/data value seen (structural key, DB URI with a
+              password, private key), or a secret-file path / database port
+              observed NOW
+    high      a sensitive file or path observed NOW (urlscan / live), or any
+              exposure `probe` confirmed reachable without auth (2xx)
+    medium    a candidate that needs `probe`: a live host whose NAME looks
+              sensitive, or a sensitive path known only from Wayback
+    low       surface, not exposure: admin/API routes, dead hosts, public keys
+
+The rule severities below are the "observed now" level. `scanner` lowers a
+finding one notch when the evidence is weaker — a Wayback-only URL, a host that
+no longer resolves — and caps name-only host matches at medium. `probe`
+restores the rule level (``base_severity``) once it confirms a hit live.
 """
 from __future__ import annotations
 
@@ -95,16 +112,37 @@ PATH_RULES = _rules(
         ("path-config", "config-exposure", "high",
          r"/(wp-config\.php|config\.(json|ya?ml|php|xml)|settings\.py"
          r"|application\.(properties|ya?ml)|web\.config|\.git-credentials)(\b|$)"),
-        ("path-backup", "backup-exposure", "high",
-         r"\.(sql|sql\.gz|bak|old|backup|swp|tar\.gz|zip)$|/(backup|dump)(/|s?\b)"),
+        # Database dumps and editor/backup copies of real files. The copy
+        # suffixes only count after a real extension (index.php.bak), so a page
+        # named "old" or a product called "dump" does not match.
+        ("path-db-dump", "backup-exposure", "high",
+         r"\.(sql|sql\.gz|sql\.bz2|sql\.zip|dump)$"),
+        ("path-backup-copy", "backup-exposure", "high",
+         r"\.\w{1,6}\.(bak|old|orig|backup|save|swp)$|\.(bak|backup)$|~$"),
+        # An archive is only a backup when its NAME says so. Plain .zip files
+        # are ordinary downloads (logos, bid attachments, manuals) — field runs
+        # were full of them ranked high.
+        ("path-backup-archive", "backup-exposure", "high",
+         r"/[^/]*(?<![a-z])(backup|bak|dump|db|database|www|htdocs|public_html"
+         r"|site|sources?|src)(?![a-z])[^/]*\.(zip|tar|tar\.gz|tgz|7z|rar)$"
+         r"|/(backups?|dumps?)/[^/]+\.(zip|tar|tar\.gz|tgz|7z|rar|gz)$"),
+        # A backup/dump DIRECTORY is a place to look, not a file seen: medium.
+        ("path-backup-dir", "backup-exposure", "medium", r"/(backups?|dumps?)/"),
         ("path-debug", "debug-exposure", "high",
          r"/(phpinfo|server-status|actuator(/|$)|\.DS_Store|env\.js)"),
-        ("path-admin", "admin-panel", "medium",
+        # A route name, not an exposure: whether it is gated is what `probe`
+        # (AUTHZ_PATH) checks. Surface only, hence low.
+        ("path-admin", "admin-panel", "low",
          r"/(admin|wp-admin|phpmyadmin|administrator)(/|$)"),
         ("path-api", "api-surface", "low",
          r"/(swagger|openapi\.(json|ya?ml)|api-docs|graphql)(/|$|\.)"),
     ]
 )
+
+# Path/URL rule id -> its rule-table severity, i.e. the level a finding earns
+# once the evidence is present-tense. Filled once the tables exist (below).
+RULE_SEVERITY: dict[str, str] = {}
+
 
 # Matched against the whole endpoint URL (query strings mostly).
 SECRET_RULES = _rules(
@@ -236,6 +274,20 @@ CLIENT_RULES = _rules(
          r"(?i)https?://[a-z0-9]{8,}\.supabase\.(?:co|in|net)"),
     ]
 )
+
+# Host rules are deliberately absent: a name match stays a candidate even when
+# the host answers 2xx at "/" (a login page answers too).
+RULE_SEVERITY.update({r.id: r.severity for r in (*PATH_RULES, *SECRET_RULES)})
+
+
+def base_severity(finding: dict) -> str:
+    """The rule's own severity, before scan lowered it for weak evidence.
+
+    `probe` uses this when it confirms a path live: a Wayback-only .git path
+    was a medium candidate, but a live unauthenticated one is high again.
+    """
+    return RULE_SEVERITY.get(finding.get("rule", ""), finding.get("severity", "medium"))
+
 
 # Known-exposure probes for `verify`, keyed by the scan rule that flagged a
 # sensitive host. Each entry is an EXACT path the finding already implies — never

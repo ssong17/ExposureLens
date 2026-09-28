@@ -15,7 +15,9 @@ class CollectorConfig:
     request_interval_seconds: float = 2.0
     timeout_seconds: float = 30.0
     max_retries: int = 3
-    retry_backoff_seconds: float = 2.0
+    # Wait before each retry (seconds): 1st, 2nd, 3rd... A retry past the end of
+    # the list reuses its last value.
+    retry_delays_seconds: tuple[float, ...] = (5.0, 15.0, 30.0)
     # Volume limits: 0 = unlimited (process everything found). There is no
     # truncation cap any more — a run finishes the whole target, pausing between
     # organizations to stay polite instead of cutting work off partway. Per-host
@@ -28,7 +30,7 @@ class CollectorConfig:
     # Seconds to rest between organizations (0 = no pause). Sequential-with-rest
     # replaces the old request cap: it lets a big run complete without hammering
     # crt.sh/Wayback/urlscan into rate-limiting the whole thing.
-    org_pause_seconds: float = 5.0
+    org_pause_seconds: float = 10.0
     # Index responses (crt.sh org search for a large org is genuinely big).
     max_response_bytes: int = 8_000_000
     # Bodies read for content rules. Separate and much smaller: a secret lives in
@@ -39,6 +41,12 @@ class CollectorConfig:
     # max_endpoints_per_org above ~1100/apex had no effect.
     wayback_limit: int = 1000
     urlscan_limit: int = 100
+    # When one *.apex Wayback query comes back full (wayback_limit rows, which
+    # CDX fills with the alphabetically-first hosts only) or fails outright,
+    # re-query that apex's live hosts one by one. Capped per apex (0 = 무제한)
+    # because each host is one request at request_interval_seconds.
+    wayback_split: bool = True
+    max_wayback_split_hosts: int = 300
     # Bounded parsed-JSON cache (entries).
     cache_entries: int = 128
 
@@ -135,6 +143,16 @@ def load_config(path: str | Path) -> AppConfig:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"[collector] {key} 값이 잘못되었습니다: {exc}") from exc
 
+    def _delays(value) -> tuple[float, ...]:
+        if value is None:
+            return CollectorConfig.retry_delays_seconds
+        if not isinstance(value, list) or not value:
+            raise ValueError("[collector] retry_delays_seconds는 숫자 목록이어야 합니다 (예: [5, 15, 30]).")
+        try:
+            return tuple(float(v) for v in value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"[collector] retry_delays_seconds 값이 잘못되었습니다: {exc}") from exc
+
     collector = CollectorConfig(
         user_agent=str(c.get("user_agent", CollectorConfig.user_agent)),
         request_interval_seconds=_num(
@@ -143,9 +161,7 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         timeout_seconds=_num("timeout_seconds", float, CollectorConfig.timeout_seconds),
         max_retries=_num("max_retries", int, CollectorConfig.max_retries),
-        retry_backoff_seconds=_num(
-            "retry_backoff_seconds", float, CollectorConfig.retry_backoff_seconds
-        ),
+        retry_delays_seconds=_delays(c.get("retry_delays_seconds")),
         max_requests=_num("max_requests", int, CollectorConfig.max_requests),
         org_pause_seconds=_num(
             "org_pause_seconds", float, CollectorConfig.org_pause_seconds
@@ -164,6 +180,10 @@ def load_config(path: str | Path) -> AppConfig:
         resolve_workers=_num("resolve_workers", int, CollectorConfig.resolve_workers),
         wayback_limit=_num("wayback_limit", int, CollectorConfig.wayback_limit),
         urlscan_limit=_num("urlscan_limit", int, CollectorConfig.urlscan_limit),
+        wayback_split=bool(c.get("wayback_split", CollectorConfig.wayback_split)),
+        max_wayback_split_hosts=_num(
+            "max_wayback_split_hosts", int, CollectorConfig.max_wayback_split_hosts
+        ),
         cache_entries=_num("cache_entries", int, CollectorConfig.cache_entries),
     )
 
@@ -207,8 +227,8 @@ def validate_config(app: AppConfig) -> None:
         raise ValueError("max_body_bytes는 max_response_bytes 이하여야 합니다.")
     if not 0 <= col.max_retries <= 5:
         raise ValueError("max_retries는 0~5 범위여야 합니다.")
-    if col.retry_backoff_seconds < 0:
-        raise ValueError("retry_backoff_seconds는 0 이상이어야 합니다.")
+    if any(d < 0 for d in col.retry_delays_seconds):
+        raise ValueError("retry_delays_seconds는 모두 0 이상이어야 합니다.")
     # 0 = unlimited for all three volume limits.
     if col.max_requests < 0:
         raise ValueError("max_requests는 0 이상이어야 합니다 (0 = 무제한).")
@@ -220,6 +240,8 @@ def validate_config(app: AppConfig) -> None:
         raise ValueError("org_pause_seconds는 0 이상이어야 합니다.")
     if col.wayback_limit < 0 or col.urlscan_limit < 0:
         raise ValueError("wayback_limit과 urlscan_limit은 0 이상이어야 합니다.")
+    if col.max_wayback_split_hosts < 0:
+        raise ValueError("max_wayback_split_hosts는 0 이상이어야 합니다 (0 = 무제한).")
     if col.cache_entries < 0:
         raise ValueError("cache_entries는 0 이상이어야 합니다.")
     if col.resolve_timeout <= 0 or col.resolve_workers < 1:

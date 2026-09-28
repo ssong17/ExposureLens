@@ -1,5 +1,7 @@
-"""Shared/CDN addresses must not be claimed as one org's exposure."""
+"""scan.services: Shodan current-service findings and IP attribution."""
 from __future__ import annotations
+
+from urllib.error import HTTPError
 
 from exposure_lens.scan.services import (
     SHARED_HOST_LIMIT,
@@ -19,7 +21,7 @@ class FakeHttp:
         FakeHttp.request_count = self.request_count + 1
         ip = url.rsplit("/", 1)[-1]
         if ip not in self._records:
-            raise Exception("404")
+            raise HTTPError(url, 404, "not found", None, None)  # no data
         return self._records[ip]
 
 
@@ -83,3 +85,48 @@ def test_service_findings_carry_org_identity():
     findings, _ = check_exposure(http, index, min_severity="low")
     assert findings[0].org_id == "snu"
     assert findings[0].org_name == "Seoul National University"
+
+
+def test_reports_risky_open_port_and_ignores_clean_ip_and_cves():
+    # A risky open port is a fact and gets reported; an IP with no data yields
+    # nothing; InternetDB `vulns` are version-inferred so they are not claimed.
+    http = FakeHttp({"1.1.1.1": {"ports": [443, 3306], "vulns": ["CVE-2024-9"]}})
+    index = build_ip_index([
+        _asset("1.1.1.1", "db.x.com"),
+        _asset("2.2.2.2", "ok.x.com"),  # not in records -> 404 -> nothing
+    ])
+    fs, _ = check_exposure(http, index, min_severity="low")
+    assert ("exposed-service", "port-3306") in {(f.category, f.rule) for f in fs}
+    assert not any(f.category == "known-cve" for f in fs)
+    assert all("2.2.2.2" not in f.evidence for f in fs)
+
+
+def test_resume_reuses_answers_and_records_new_ones():
+    index = build_ip_index([_asset("1.1.1.1", "db.x.com"), _asset("2.2.2.2", "b.x.com")])
+    http = FakeHttp({"2.2.2.2": {"ports": [6379]}})
+    asked = []
+    http.get_json = lambda url, _g=http.get_json: asked.append(url) or _g(url)
+    recorded = {}
+    findings, _ = check_exposure(
+        http, index, min_severity="low",
+        answers={"1.1.1.1": {"ports": [3306]}},
+        on_answer=recorded.__setitem__,
+    )
+    assert [u.rsplit("/", 1)[-1] for u in asked] == ["2.2.2.2"]  # 1.1.1.1 reused
+    assert recorded == {"2.2.2.2": {"ports": [6379]}}
+    assert {f.rule for f in findings} == {"port-3306", "port-6379"}
+
+
+def test_failed_query_is_reported_not_treated_as_clean():
+    class Broken(FakeHttp):
+        def get_json(self, url):
+            raise TimeoutError("timed out")
+
+    index = build_ip_index([_asset("1.1.1.1", "db.x.com")])
+    recorded = {}
+    findings, problems = check_exposure(
+        Broken({}), index, min_severity="low", on_answer=recorded.__setitem__,
+    )
+    assert not findings
+    assert recorded == {}  # not saved, so a resume asks again
+    assert any("조회 실패" in p for p in problems)
