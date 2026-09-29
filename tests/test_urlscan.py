@@ -1,3 +1,4 @@
+"""urlscan.io adapter: recent observations with recency and paging."""
 from __future__ import annotations
 
 from exposure_lens.sources import urlscan

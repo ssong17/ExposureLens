@@ -1,3 +1,4 @@
+"""Rate-limited HTTP client: retries, backoff ladder, network-down, throttle."""
 from __future__ import annotations
 
 import urllib.error

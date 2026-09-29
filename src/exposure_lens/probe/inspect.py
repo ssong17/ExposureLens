@@ -173,7 +173,7 @@ def inspect_assets(
     source: str = WAYBACK,
     min_severity: str = "medium",
     finding_urls: set[str] | None = None,
-    max_targets: int = 0,  # 0 = 무제한
+    max_targets: int = 0,  # 0 = unlimited
     scripts_only: bool = False,
     next_id: "Callable[[], str] | None" = None,
     dedup: "dict[tuple[str, str, str], int] | None" = None,
@@ -308,7 +308,7 @@ def run_inspection(
     source: str = FETCH,
     min_severity: str = "low",
     confidence: str = "high",
-    max_targets: int = 0,  # 0 = 무제한
+    max_targets: int = 0,  # 0 = unlimited
     scripts_only: bool = False,
     only_findings: bool = False,
     restrict_body_urls: set[str] | None = None,

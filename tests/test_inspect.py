@@ -1,3 +1,4 @@
+"""Body inspection: target/confidence gating, secrets, authz, sourcemaps."""
 from __future__ import annotations
 
 from exposure_lens.probe.inspect import FETCH, WAYBACK, _select_targets, inspect_assets

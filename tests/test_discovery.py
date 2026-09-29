@@ -1,3 +1,4 @@
+"""Apex discovery: seed anchoring keeps same-named foreign orgs out."""
 from __future__ import annotations
 
 from exposure_lens.collect.discovery import _confidence

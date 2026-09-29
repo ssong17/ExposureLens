@@ -1,3 +1,4 @@
+"""Asset merge: union, dedup, IP backfill, stable record ids."""
 from __future__ import annotations
 
 from exposure_lens.collect.merge import merge_assets

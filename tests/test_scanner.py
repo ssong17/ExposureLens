@@ -1,7 +1,10 @@
+"""Passive rules: host/path/secret detection, severity, masking, dedup."""
 from __future__ import annotations
 
 from exposure_lens.core.models import FindingIds
 from exposure_lens.scan.scanner import _mask, _mask_match, scan_assets, scan_body
+
+from _helpers import run_scan_body
 
 
 def _asset(**kw) -> dict:
@@ -77,10 +80,9 @@ def test_mask():
 
 
 def _body(text: str):
-    return scan_body(
-        text, asset={"record_id": "R", "org_id": "x", "host": "h"},
-        url="https://h/static/app.js", status="200", source="wayback-body",
-        min_severity="low", next_id=FindingIds("T", date="20260101"),
+    return run_scan_body(
+        text, url="https://h/static/app.js", source="wayback-body",
+        next_id=FindingIds("T", date="20260101"),
     )
 
 

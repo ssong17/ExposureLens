@@ -1,3 +1,4 @@
+"""Verification: liveness + known-exposure probes on scan findings."""
 from __future__ import annotations
 
 from exposure_lens.probe.verify import (

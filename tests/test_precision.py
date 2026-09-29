@@ -6,19 +6,15 @@ from exposure_lens.scan.scanner import (
     is_credible_secret,
     is_placeholder,
     scan_assets,
-    scan_body,
 )
+
+from _helpers import run_scan_body
 
 
 def _body(text: str, min_severity: str = "low"):
-    return scan_body(
-        text,
-        asset={"record_id": "R", "org_id": "x", "host": "h"},
-        url="https://h/app.js",
-        status="200",
-        source="fetch-body",
-        min_severity=min_severity,
-        next_id=FindingIds("T", date="20260101"),
+    return run_scan_body(
+        text, min_severity=min_severity,
+        next_id=FindingIds("T", date="20260101"), source="fetch-body",
     )
 
 

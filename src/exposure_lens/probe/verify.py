@@ -100,7 +100,7 @@ def verify_findings(
     assets_by_id: dict[str, dict] | None = None,
     *,
     min_severity: str = "low",
-    max_targets: int = 0,  # 0 = 무제한
+    max_targets: int = 0,  # 0 = unlimited
     confidence: str = "high",
     next_id: "Callable[[], str] | None" = None,
     dedup: "dict[tuple[str, str, str], int] | None" = None,

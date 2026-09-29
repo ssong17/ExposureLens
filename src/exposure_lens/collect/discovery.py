@@ -58,7 +58,7 @@ def _confidence(
 
     # Cert dominance grants high ONLY when unanchored or in the seed family.
     # Otherwise a same-named foreign org that dominates crt.sh (e.g. SOCAR the
-    # oil company vs 쏘카 socarcorp.kr) would hijack the collection.
+    # oil company vs SOCAR socarcorp.kr) would hijack the collection.
     if dominant and related:
         evidence.append("cert_rank_1")
         return "high", evidence

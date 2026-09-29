@@ -9,19 +9,15 @@ not in the assignment rule, and a URL value must stay verbatim (masking it to
 from __future__ import annotations
 
 from exposure_lens.core.models import FindingIds
-from exposure_lens.scan.scanner import scan_body
+from _helpers import run_scan_body
 
 
 def _body(text: str, min_severity: str = "low"):
-    return scan_body(
-        text,
-        asset={"record_id": "R", "org_id": "x", "org_name": "X", "host": "h"},
-        url="https://h/_next/static/chunks/main.js",
-        status="200",
-        source="fetch-body",
-        min_severity=min_severity,
-        next_id=FindingIds("P"),
+    return run_scan_body(
+        text, min_severity=min_severity, next_id=FindingIds("P"),
+        url="https://h/_next/static/chunks/main.js", source="fetch-body",
         freshness="current",
+        asset={"record_id": "R", "org_id": "x", "org_name": "X", "host": "h"},
     )
 
 

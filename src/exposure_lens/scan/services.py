@@ -93,7 +93,7 @@ def check_exposure(
     ip_index: dict[str, IpInfo],
     *,
     min_severity: str = "medium",
-    max_ips: int = 0,  # 0 = 무제한
+    max_ips: int = 0,  # 0 = unlimited
     log: Callable[[str], None] | None = None,
     answers: dict[str, dict | None] | None = None,
     on_answer: Callable[[str, dict | None], None] | None = None,
