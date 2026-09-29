@@ -25,6 +25,10 @@ class CollectorConfig:
     max_requests: int = 0
     max_apex_per_org: int = 0
     max_endpoints_per_org: int = 0
+    # Query-string variants of one (host, path) to keep, e.g. board.php?idx=1,
+    # ?idx=2, ?page=9 … They render the same page and rarely differ in exposed
+    # secrets, so a few are enough. 0 = unlimited (keep every variant).
+    max_endpoint_variants_per_path: int = 5
     resolve_timeout: float = 3.0
     resolve_workers: int = 20
     # Seconds to rest between organizations (0 = no pause). Sequential-with-rest
@@ -43,7 +47,7 @@ class CollectorConfig:
     urlscan_limit: int = 100
     # When one *.apex Wayback query comes back full (wayback_limit rows, which
     # CDX fills with the alphabetically-first hosts only) or fails outright,
-    # re-query that apex's live hosts one by one. Capped per apex (0 = 무제한)
+    # re-query that apex's live hosts one by one. Capped per apex (0 = unlimited)
     # because each host is one request at request_interval_seconds.
     wayback_split: bool = True
     max_wayback_split_hosts: int = 300
@@ -112,7 +116,7 @@ def _load_raw(path: Path) -> dict:
         with path.open("rb") as handle:
             return tomllib.load(handle)
 
-    # *.example.toml 은 형식 예시이므로 로드 대상에서 제외한다.
+    # *.example.toml is a format sample, so it is excluded from loading.
     files = sorted(
         p for p in path.glob("*.toml")
         if p.is_file() and ".example." not in p.name
@@ -180,6 +184,10 @@ def load_config(path: str | Path) -> AppConfig:
         max_endpoints_per_org=_num(
             "max_endpoints_per_org", int, CollectorConfig.max_endpoints_per_org
         ),
+        max_endpoint_variants_per_path=_num(
+            "max_endpoint_variants_per_path", int,
+            CollectorConfig.max_endpoint_variants_per_path,
+        ),
         resolve_timeout=_num("resolve_timeout", float, CollectorConfig.resolve_timeout),
         resolve_workers=_num("resolve_workers", int, CollectorConfig.resolve_workers),
         wayback_limit=_num("wayback_limit", int, CollectorConfig.wayback_limit),
@@ -244,6 +252,8 @@ def validate_config(app: AppConfig) -> None:
         raise ValueError("max_apex_per_org는 0 이상이어야 합니다 (0 = 무제한).")
     if col.max_endpoints_per_org < 0:
         raise ValueError("max_endpoints_per_org는 0 이상이어야 합니다 (0 = 무제한).")
+    if col.max_endpoint_variants_per_path < 0:
+        raise ValueError("max_endpoint_variants_per_path는 0 이상이어야 합니다 (0 = 무제한).")
     if col.org_pause_seconds < 0:
         raise ValueError("org_pause_seconds는 0 이상이어야 합니다.")
     if col.wayback_limit < 0 or col.urlscan_limit < 0:

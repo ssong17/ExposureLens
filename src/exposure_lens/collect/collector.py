@@ -72,14 +72,33 @@ def select_target_apexes(
 ) -> list[ApexCandidate]:
     targets = [c for c in candidates if c.confidence in TARGET_CONFIDENCES]
     targets.sort(key=lambda c: (CONFIDENCE_ORDER[c.confidence], -c.cert_count))
-    return targets[:limit] if limit else targets  # limit 0 = 무제한
+    return targets[:limit] if limit else targets  # limit 0 = unlimited
+
+
+def _variant_key(host: str, url: str) -> tuple[str, str]:
+    """Bucket a URL by (host, path), ignoring the query string.
+
+    ``/board.php?idx=1``, ``?idx=2``, ``?page=9`` … are the same page rendered
+    with different arguments — pagination, board ids, modes, cache-busters. They
+    almost never differ in exposed secrets/structure, so one page that Wayback
+    archived under hundreds of query strings should not become hundreds of
+    endpoints (it bloats collect and, worse, fills the Wayback 1000-row cap so
+    other subdomains get squeezed out). Keyed by path, not by a specific param,
+    so every such family collapses, not just ``idx``.
+    """
+    return host, urlsplit(url).path
 
 
 def _ingest(
     state: OrgProgress, collector: CollectorConfig, cand: ApexCandidate,
-    obs: list[dict], src: str,
+    obs: list[dict], src: str, variant_counts: dict[tuple[str, str], int],
 ) -> None:
-    """Fold observed URLs into ``state``: their hosts, and non-static endpoints."""
+    """Fold observed URLs into ``state``: their hosts, and non-static endpoints.
+
+    ``variant_counts`` caps how many query-string variants of one (host, path)
+    are stored (``max_endpoint_variants_per_path``); the rest are dropped here.
+    """
+    cap = collector.max_endpoint_variants_per_path
     for o in obs:
         url = o["url"]
         host = (urlsplit(url).hostname or "").lower()
@@ -92,10 +111,15 @@ def _ingest(
         # urlscan (present-tense) upgrades a wayback-only entry; keep the more
         # recent last_seen.
         if prev is None:
-            # max_endpoints_per_org 0 = 무제한
+            # max_endpoints_per_org 0 = unlimited
             if (collector.max_endpoints_per_org
                     and len(state.endpoint_meta) >= collector.max_endpoints_per_org):
                 continue
+            # Cap query-string variants of the same page (0 = unlimited).
+            vkey = _variant_key(host, url)
+            if cap and variant_counts.get(vkey, 0) >= cap:
+                continue
+            variant_counts[vkey] = variant_counts.get(vkey, 0) + 1
             state.endpoint_meta[url] = [
                 cand.apex, cand.confidence, host, src, o.get("seen", "")]
         elif src == "urlscan" and prev[3] != "urlscan":
@@ -139,6 +163,7 @@ def _collect_wayback(
     collector: CollectorConfig,
     cand: ApexCandidate,
     state: OrgProgress,
+    variant_counts: dict[tuple[str, str], int],
     *,
     resolve: bool,
     log: Callable[[str], None],
@@ -165,7 +190,7 @@ def _collect_wayback(
         raise
     except Exception as exc:  # noqa: BLE001
         urls, failed = [], str(exc)
-    _ingest(state, collector, cand, wayback.as_observations(urls), "wayback")
+    _ingest(state, collector, cand, wayback.as_observations(urls), "wayback", variant_counts)
 
     truncated = len(urls) >= limit
     if not (truncated or failed) or not collector.wayback_split:
@@ -198,7 +223,7 @@ def _collect_wayback(
         consecutive = 0
         if len(got) >= limit:
             truncated_hosts += 1  # a single host with >limit URLs is itself cut
-        _ingest(state, collector, cand, wayback.as_observations(got), "wayback")
+        _ingest(state, collector, cand, wayback.as_observations(got), "wayback", variant_counts)
         if i % 50 == 0:
             log(f"[{org.org_id}]   wayback 호스트별 {i}/{len(hosts)}")
 
@@ -226,6 +251,7 @@ def _collect_apex(
     collector: CollectorConfig,
     cand: ApexCandidate,
     state: OrgProgress,
+    variant_counts: dict[tuple[str, str], int] | None = None,
     *,
     endpoints: bool,
     resolve: bool = True,
@@ -240,6 +266,8 @@ def _collect_apex(
     Returns True when the apex's endpoint data was lost to a source outage (see
     ``_collect_wayback``), so the caller can leave the apex for ``--resume``.
     """
+    if variant_counts is None:
+        variant_counts = {}
     try:
         for host in crtsh.domain_search(http, cand.apex):
             state.host_apex.setdefault(host, [cand.apex, cand.confidence])
@@ -254,14 +282,14 @@ def _collect_apex(
     if collector.urlscan_limit > 0:
         try:
             obs = urlscan.fetch_observations(http, cand.apex, collector.urlscan_limit)
-            _ingest(state, collector, cand, obs, "urlscan")
+            _ingest(state, collector, cand, obs, "urlscan", variant_counts)
         except (RequestBudgetExceeded, NetworkDown):
             raise
         except Exception as exc:  # noqa: BLE001
             state.problems.append(f"[{org.org_id}] urlscan {cand.apex}: {exc}")
     if collector.wayback_limit > 0:
         return _collect_wayback(
-            http, org, collector, cand, state,
+            http, org, collector, cand, state, variant_counts,
             resolve=resolve, log=log or (lambda _: None),
         )
     return False
@@ -339,6 +367,13 @@ def collect_org(
     # url -> [apex, conf, host, endpoint_source, last_seen]
     endpoint_meta = state.endpoint_meta
     done = set(state.done_apexes)
+    # (host, path) -> stored variant count, rebuilt from what resume loaded so
+    # the per-page cap holds across a resumed run too.
+    variant_counts: dict[tuple[str, str], int] = {}
+    for url, meta in endpoint_meta.items():
+        variant_counts[_variant_key(meta[2], url)] = (
+            variant_counts.get(_variant_key(meta[2], url), 0) + 1
+        )
 
     for i, cand in enumerate(targets, 1):
         if cand.apex in done:
@@ -347,7 +382,7 @@ def collect_org(
         before = http.connect_failure_total
         try:
             lost = _collect_apex(
-                http, org, collector, cand, state,
+                http, org, collector, cand, state, variant_counts,
                 endpoints=endpoints, resolve=resolve, log=say,
             )
         except RequestBudgetExceeded as exc:

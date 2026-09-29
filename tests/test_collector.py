@@ -1,3 +1,4 @@
+"""Collector: apex discovery, per-apex resume, Wayback split, host filtering."""
 from __future__ import annotations
 
 from exposure_lens.collect.discovery import discover_apex
@@ -315,3 +316,39 @@ def test_phone_number_host_is_rejected():
     assert not _valid_host("82-31-478-7879www.enscorp.co.kr")
     assert _valid_host("www.enscorp.co.kr")
     assert _valid_host("24-7.example.com")  # single group: real
+
+
+# ---- collect: cap query-string variants of one (host, path) ------------------
+
+def test_query_variants_of_one_page_are_capped_at_collect(monkeypatch):
+    # One page archived under 10 query strings -> only cap kept.
+    urls = [f"https://x.com/board.php?idx={i}" for i in range(10)]
+    monkeypatch.setattr(collector_mod.crtsh, "domain_search", lambda http, apex: set())
+    monkeypatch.setattr(collector_mod.urlscan, "fetch_observations",
+                        lambda http, apex, limit: [])
+    monkeypatch.setattr(collector_mod.wayback, "fetch_urls", lambda http, apex, limit: urls)
+    org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
+    cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
+    state = OrgProgress(org_id="x")
+    collector_mod._collect_apex(
+        _LinkHttp(), org, CollectorConfig(max_endpoint_variants_per_path=3),
+        cand, state, endpoints=True,
+    )
+    assert len(state.endpoint_meta) == 3  # 10 idx variants -> 3 kept
+
+
+def test_different_paths_are_not_collapsed(monkeypatch):
+    urls = ["https://x.com/a.php?x=1", "https://x.com/b.php?x=1",
+            "https://x.com/c.php?x=1"]
+    monkeypatch.setattr(collector_mod.crtsh, "domain_search", lambda http, apex: set())
+    monkeypatch.setattr(collector_mod.urlscan, "fetch_observations",
+                        lambda http, apex, limit: [])
+    monkeypatch.setattr(collector_mod.wayback, "fetch_urls", lambda http, apex, limit: urls)
+    org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
+    cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
+    state = OrgProgress(org_id="x")
+    collector_mod._collect_apex(
+        _LinkHttp(), org, CollectorConfig(max_endpoint_variants_per_path=3),
+        cand, state, endpoints=True,
+    )
+    assert len(state.endpoint_meta) == 3  # distinct paths all kept

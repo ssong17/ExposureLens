@@ -42,6 +42,7 @@ retry_delays_seconds = [2, 4, 8, 16, 32]  # 재시도 전 대기(초): 1~5회차
 max_requests = 0                 # 0 = 무제한
 max_apex_per_org = 0             # 0 = 무제한
 max_endpoints_per_org = 0        # 0 = 무제한
+max_endpoint_variants_per_path = 5  # 같은 (호스트,경로) 쿼리 변형 보관 수 (0=무제한)
 org_pause_seconds = 5.0          # 기관 사이 휴식(초)
 max_response_bytes = 8000000     # 색인 응답 상한
 max_body_bytes = 1000000         # 본문 규칙 대상 상한(응답 상한 이하)
