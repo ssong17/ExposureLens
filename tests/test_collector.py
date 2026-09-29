@@ -228,7 +228,7 @@ def test_full_wayback_answer_is_split_over_live_uncovered_hosts(monkeypatch):
     # old.x.com does not resolve -> skipped.
     assert sorted(asked) == ["shop.x.com", "www.x.com"]
     assert "https://shop.x.com/page.php" in state.endpoint_meta
-    assert any("상한 도달" in p and "2개 개별 조회" in p for p in state.problems)
+    assert any("상한 도달" in p and "2/2개 조회" in p for p in state.problems)
 
 
 def test_failed_wayback_query_is_split_too(monkeypatch):
@@ -252,3 +252,66 @@ def test_split_can_be_turned_off(monkeypatch):
     state = _run_apex(wayback_limit=3, wayback_split=False)
     assert asked == []
     assert any("wayback x.com: CDX timed out" in p for p in state.problems)
+
+
+# ---- fix: source outage leaves the apex unfinished (redo on resume) ----------
+
+def test_total_wayback_failure_marks_apex_incomplete(monkeypatch):
+    asked = _wayback_setup(monkeypatch, [], fail=True, crt_hosts=("a.x.com", "b.x.com"))
+
+    def all_fail(http, host, limit):
+        asked.append(host)
+        raise TimeoutError("503")
+
+    monkeypatch.setattr(collector_mod.wayback, "fetch_host_urls", all_fail)
+    org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
+    cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
+    state = OrgProgress(org_id="x")
+    lost = collector_mod._collect_apex(
+        _LinkHttp(), org, collector_mod.CollectorConfig(wayback_limit=3),
+        cand, state, endpoints=True,
+    )
+    assert lost is True  # nothing recovered -> caller must not mark it done
+
+
+def test_partial_recovery_is_not_marked_lost(monkeypatch):
+    # apex query fails, but the per-host retries succeed -> data recovered.
+    _wayback_setup(monkeypatch, [], fail=True, crt_hosts=("a.x.com", "b.x.com"))
+    org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
+    cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
+    state = OrgProgress(org_id="x")
+    lost = collector_mod._collect_apex(
+        _LinkHttp(), org, collector_mod.CollectorConfig(wayback_limit=3),
+        cand, state, endpoints=True,
+    )
+    assert lost is False  # hosts answered, so the apex is complete
+
+
+def test_split_circuit_breaker_stops_after_consecutive_failures(monkeypatch):
+    hosts = tuple(f"h{i:02d}.x.com" for i in range(20))
+    asked = _wayback_setup(monkeypatch, [], fail=True, crt_hosts=hosts)
+
+    def always_fail(http, host, limit):
+        asked.append(host)
+        raise TimeoutError("503")
+
+    monkeypatch.setattr(collector_mod.wayback, "fetch_host_urls", always_fail)
+    org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
+    cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
+    state = OrgProgress(org_id="x")
+    lost = collector_mod._collect_apex(
+        _LinkHttp(), org,
+        collector_mod.CollectorConfig(wayback_limit=3, wayback_split_failure_cutoff=5),
+        cand, state, endpoints=True,
+    )
+    assert len(asked) == 5   # broke after 5 consecutive failures, not all 20
+    assert lost is True
+    assert any("연속 5회 실패로 중단" in p for p in state.problems)
+
+
+def test_phone_number_host_is_rejected():
+    from exposure_lens.collect.collector import _valid_host
+    assert not _valid_host("031-478-7879www.enscorp.co.kr")
+    assert not _valid_host("82-31-478-7879www.enscorp.co.kr")
+    assert _valid_host("www.enscorp.co.kr")
+    assert _valid_host("24-7.example.com")  # single group: real

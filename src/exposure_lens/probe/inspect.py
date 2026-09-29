@@ -104,6 +104,13 @@ def _is_script_like(url: str) -> bool:
     return ext in _SCRIPT_EXT
 
 
+# Keep at most this many query-string variants of one (host, path). The 455
+# `?page=1..N` copies of one template all serve the same body, so probing every
+# one cost ~4h and (before dedup) reported the same secret hundreds of times. A
+# few variants still cover the case where the query genuinely changes the body.
+_MAX_VARIANTS_PER_PATH = 3
+
+
 def _select_targets(
     assets: list[dict],
     finding_urls: set[str] | None,
@@ -112,6 +119,7 @@ def _select_targets(
 ) -> list[dict]:
     targets: list[dict] = []
     seen: set[str] = set()
+    variants: dict[tuple[str, str], int] = {}
     for asset in assets:
         if asset.get("asset_type") != "endpoint":
             continue
@@ -124,6 +132,15 @@ def _select_targets(
             continue
         if scripts_only and not _is_script_like(url):
             continue
+        # Collapse query-string variants of one path (unless an explicit finding
+        # URL list already pinned exactly which URLs to read).
+        if finding_urls is None:
+            parts = urlsplit(url)
+            vkey = (parts.hostname or "", parts.path)
+            n = variants.get(vkey, 0)
+            if n >= _MAX_VARIANTS_PER_PATH:
+                continue
+            variants[vkey] = n + 1
         seen.add(url)
         targets.append(asset)
     return targets
@@ -159,9 +176,17 @@ def inspect_assets(
     max_targets: int = 0,  # 0 = 무제한
     scripts_only: bool = False,
     next_id: "Callable[[], str] | None" = None,
+    dedup: "dict[tuple[str, str, str], int] | None" = None,
+    missed_out: "list[str] | None" = None,
     log: Callable[[str], None] | None = None,
 ) -> tuple[list[Finding], list[str]]:
-    """Body-reading half of the active stage. ``source`` is WAYBACK or FETCH."""
+    """Body-reading half of the active stage. ``source`` is WAYBACK or FETCH.
+
+    ``dedup`` (see ``scan_body``) collapses one templated secret across pages.
+    ``missed_out``: on a WAYBACK pass, endpoint URLs the archive had no snapshot
+    for are appended here, so the caller's active pass can fetch just those live
+    (the "catch what passive missed" half of the flow).
+    """
     say = log or (lambda _: None)
     next_id = next_id or FindingIds("I")
     problems: list[str] = []
@@ -190,6 +215,11 @@ def inspect_assets(
             break
         say(f"  ({i}/{len(targets)}) {status or '-'} {url}")
 
+        # Archive had no usable snapshot for this URL: note it so a later active
+        # pass can fetch it live (passive could not see it).
+        if source == WAYBACK and not text and missed_out is not None:
+            missed_out.append(url)
+
         # A direct fetch always yields a liveness signal; record it even when the
         # body is clean so the report can rank live exposures above stale ones.
         if source == FETCH:
@@ -216,6 +246,7 @@ def inspect_assets(
                 min_severity=min_severity,
                 next_id=next_id,
                 freshness=body_freshness,
+                dedup=dedup,
             )
         )
 
@@ -240,6 +271,7 @@ def inspect_assets(
                         min_severity=min_severity,
                         next_id=next_id,
                         freshness=body_freshness,
+                        dedup=dedup,
                     )
                 )
 
@@ -255,6 +287,9 @@ class InspectionResult:
     findings: list[Finding] = field(default_factory=list)
     liveness: list[Finding] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    # Endpoint URLs the archive had no snapshot for (WAYBACK pass only). The
+    # active pass fetches these live to cover what passive could not see.
+    missed: list[str] = field(default_factory=list)
 
     @property
     def rows(self) -> list[Finding]:
@@ -276,31 +311,45 @@ def run_inspection(
     max_targets: int = 0,  # 0 = 무제한
     scripts_only: bool = False,
     only_findings: bool = False,
+    restrict_body_urls: set[str] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> InspectionResult:
     """The whole active stage: body inspection + finding verification.
 
     One ``FindingIds`` allocator is shared by both halves, so ids are unique
     across the run.
+
+    ``restrict_body_urls`` (when not None) limits body reads to exactly those
+    URLs — the pipeline passes the archive's misses here so a FETCH pass reads
+    only what passive could not. On a WAYBACK pass the archive's misses are
+    recorded in ``result.missed`` for that later FETCH pass.
     """
     prior_findings = prior_findings or []
     next_id = FindingIds("P")
     result = InspectionResult()
+    # One dedup map for the whole pass: a secret in a shared template is counted
+    # per org, reported once (see scan_body). Shared by body inspection and
+    # verification so a value seen by both is not emitted twice.
+    dedup: dict[tuple[str, str, str], int] = {}
 
-    finding_urls: set[str] | None = None
-    if only_findings:
+    if restrict_body_urls is not None:
+        finding_urls: set[str] | None = restrict_body_urls
+    elif only_findings:
         finding_urls = {
             f.get("url", "") for f in prior_findings
             # base_severity: an archived .git path scanned as a medium
             # candidate is exactly what this pass exists to check.
             if f.get("url") and base_severity(f) in ("critical", "high")
         }
+    else:
+        finding_urls = None
 
     # 1) endpoint bodies -> secrets/config/DB/PII/JS/authz (+ liveness in fetch)
     rows, problems = inspect_assets(
         http, assets, source=source, min_severity=min_severity,
         finding_urls=finding_urls, max_targets=max_targets,
-        scripts_only=scripts_only, next_id=next_id, log=log,
+        scripts_only=scripts_only, next_id=next_id, dedup=dedup,
+        missed_out=result.missed if source == WAYBACK else None, log=log,
     )
     result.problems.extend(problems)
 
@@ -311,12 +360,33 @@ def run_inspection(
         ver, vproblems = verify_findings(
             http, prior_findings, assets_by_id, min_severity=min_severity,
             confidence=confidence, max_targets=max_targets,
-            next_id=next_id, log=log,
+            next_id=next_id, dedup=dedup, log=log,
         )
         rows.extend(ver)
         result.problems.extend(vproblems)
 
+    rows = _annotate_duplicates(rows, dedup)
+    suppressed = sum(n - 1 for n in dedup.values() if n > 1)
+    if suppressed:
+        result.problems.append(
+            f"같은 시크릿이 여러 페이지에 반복돼 {suppressed}건을 합쳤습니다 "
+            f"(finding당 '(+N pages)'로 표시)"
+        )
     for row in rows:
         (result.liveness if is_liveness(row) else result.findings).append(row)
     result.findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
     return result
+
+
+def _annotate_duplicates(
+    rows: list[Finding], dedup: dict[tuple[str, str, str], int]
+) -> list[Finding]:
+    """Append '(+N pages)' to a finding whose secret recurred on other pages."""
+    from dataclasses import replace
+    out: list[Finding] = []
+    for f in rows:
+        extra = dedup.get((f.org_id, f.rule, f.evidence), 1) - 1
+        if extra > 0:
+            f = replace(f, evidence=f"{f.evidence} (+{extra} pages)")
+        out.append(f)
+    return out

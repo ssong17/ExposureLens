@@ -239,6 +239,7 @@ def scan_body(
     min_severity: str = "medium",
     next_id,
     freshness: str = "",
+    dedup: "dict[tuple[str, str, str], int] | None" = None,
 ) -> list[Finding]:
     """Apply CONTENT_RULES/CLIENT_RULES to one response body already fetched.
 
@@ -247,10 +248,17 @@ def scan_body(
     nothing here contacts the target — the caller supplies the body.
     ``next_id`` is the run-wide id allocator (see ``FindingIds``) so ids stay
     unique no matter how many stages emit findings into one run.
+
+    ``dedup`` collapses the SAME secret across bodies. One token embedded in a
+    shared header/footer template appears on every page; without this a run over
+    455 pages reported one JWT 455 times and buried the real findings. When
+    passed (a run-wide dict keyed ``(org_id, rule_id, evidence)``), the first
+    body to hit a value emits the finding and later bodies only bump its count.
     """
     limit = SEVERITY_ORDER[min_severity]
     findings: list[Finding] = []
     seen: set[tuple[str, str]] = set()
+    org_id = asset.get("org_id", "")
     host = asset.get("host", "")
     record_id = asset.get("record_id", "")
     path = urlsplit(url).path
@@ -274,6 +282,14 @@ def scan_body(
             if key in seen:
                 continue
             seen.add(key)
+            # Same value already reported for this org (another page's copy of a
+            # templated token): count it, do not emit a second finding.
+            if dedup is not None:
+                gkey = (org_id, rule.id, evidence)
+                if gkey in dedup:
+                    dedup[gkey] += 1
+                    continue
+                dedup[gkey] = 1
             hits += 1
             if hits > MAX_MATCHES_PER_RULE:
                 break

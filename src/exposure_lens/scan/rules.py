@@ -35,8 +35,27 @@ class Rule:
     pattern: re.Pattern[str]
 
 
+# Rules whose whole point is a fixed-case prefix: an AWS key is AKIA (upper), a
+# JWT is eyJ, a GitHub token ghp_ (lower), a PEM header is uppercase. Matching
+# these case-insensitively turns any base64/hex blob containing "akia" or "EYJ"
+# into a fake credential — the exact critical/high false positives a field run
+# hit. These compile case-sensitively; everything else keeps IGNORECASE so
+# ".ZIP" paths and "API_KEY=" query params still match.
+CASE_SENSITIVE_RULES = frozenset(
+    {
+        "body-aws-akid", "body-slack", "body-private-key", "body-google-api",
+        "body-jwt", "body-github-token", "body-stripe-key",
+        "secret-aws-akid", "secret-slack", "secret-private-key",
+        "secret-google-api", "secret-jwt",
+    }
+)
+
+
 def _rules(specs: list[tuple[str, str, str, str]]) -> list[Rule]:
-    return [Rule(i, c, s, re.compile(p, re.IGNORECASE)) for i, c, s, p in specs]
+    return [
+        Rule(i, c, s, re.compile(p, 0 if i in CASE_SENSITIVE_RULES else re.IGNORECASE))
+        for i, c, s, p in specs
+    ]
 
 
 # Rules whose match is a *shape* anyone could write by accident — a quoted

@@ -14,10 +14,10 @@ class CollectorConfig:
     user_agent: str = "PublicAssetResearch/0.2 (+security-research)"
     request_interval_seconds: float = 2.0
     timeout_seconds: float = 30.0
-    max_retries: int = 3
-    # Wait before each retry (seconds): 1st, 2nd, 3rd... A retry past the end of
-    # the list reuses its last value.
-    retry_delays_seconds: tuple[float, ...] = (5.0, 15.0, 30.0)
+    max_retries: int = 5
+    # Wait before each retry (seconds): 1st, 2nd, ... A retry past the end of the
+    # list reuses its last value. Short first wait, then doubling.
+    retry_delays_seconds: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 32.0)
     # Volume limits: 0 = unlimited (process everything found). There is no
     # truncation cap any more — a run finishes the whole target, pausing between
     # organizations to stay polite instead of cutting work off partway. Per-host
@@ -30,7 +30,7 @@ class CollectorConfig:
     # Seconds to rest between organizations (0 = no pause). Sequential-with-rest
     # replaces the old request cap: it lets a big run complete without hammering
     # crt.sh/Wayback/urlscan into rate-limiting the whole thing.
-    org_pause_seconds: float = 10.0
+    org_pause_seconds: float = 5.0
     # Index responses (crt.sh org search for a large org is genuinely big).
     max_response_bytes: int = 8_000_000
     # Bodies read for content rules. Separate and much smaller: a secret lives in
@@ -47,6 +47,10 @@ class CollectorConfig:
     # because each host is one request at request_interval_seconds.
     wayback_split: bool = True
     max_wayback_split_hosts: int = 300
+    # Circuit breaker: after this many host queries fail in a row during a
+    # split, stop — Wayback is down, not this host, and each failed host costs
+    # the full retry ladder (~50s). 0 = never break.
+    wayback_split_failure_cutoff: int = 5
     # Bounded parsed-JSON cache (entries).
     cache_entries: int = 128
 
@@ -184,6 +188,10 @@ def load_config(path: str | Path) -> AppConfig:
         max_wayback_split_hosts=_num(
             "max_wayback_split_hosts", int, CollectorConfig.max_wayback_split_hosts
         ),
+        wayback_split_failure_cutoff=_num(
+            "wayback_split_failure_cutoff", int,
+            CollectorConfig.wayback_split_failure_cutoff,
+        ),
         cache_entries=_num("cache_entries", int, CollectorConfig.cache_entries),
     )
 
@@ -242,6 +250,8 @@ def validate_config(app: AppConfig) -> None:
         raise ValueError("wayback_limit과 urlscan_limit은 0 이상이어야 합니다.")
     if col.max_wayback_split_hosts < 0:
         raise ValueError("max_wayback_split_hosts는 0 이상이어야 합니다 (0 = 무제한).")
+    if col.wayback_split_failure_cutoff < 0:
+        raise ValueError("wayback_split_failure_cutoff는 0 이상이어야 합니다 (0 = 무제한).")
     if col.cache_entries < 0:
         raise ValueError("cache_entries는 0 이상이어야 합니다.")
     if col.resolve_timeout <= 0 or col.resolve_workers < 1:

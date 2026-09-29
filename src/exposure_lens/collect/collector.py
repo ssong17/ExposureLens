@@ -25,6 +25,11 @@ from ..sources import crtsh, cymru, urlscan, wayback
 from .resolve import resolve_hosts
 
 _ID_SANITIZE = re.compile(r"[^A-Z0-9]+")
+# A label that opens with a phone-number-shaped run (two-plus digits, then two
+# or more hyphen-digit groups) is scraped junk — e.g. "031-478-7879www" glued
+# from a `tel:` link, which a wildcard DNS then happily resolves. Real labels
+# like "24-7" (one group) or "3-com" (one digit) are left alone.
+_PHONE_LABEL = re.compile(r"^\d{2,}(?:-\d+){2,}")
 TARGET_CONFIDENCES = ("high", "medium")
 # With at least this many hosts, zero resolving means our DNS was down.
 RESOLVE_SANITY_HOSTS = 5
@@ -45,7 +50,9 @@ def _valid_host(host: str) -> bool:
     if not host or len(host) > 253:
         return False
     labels = host.split(".")
-    return all(0 < len(lbl) <= 63 for lbl in labels)
+    if not all(0 < len(lbl) <= 63 for lbl in labels):
+        return False
+    return not any(_PHONE_LABEL.match(lbl) for lbl in labels)
 
 
 def _in_scope(host: str, apex: str) -> bool:
@@ -135,7 +142,7 @@ def _collect_wayback(
     *,
     resolve: bool,
     log: Callable[[str], None],
-) -> None:
+) -> bool:
     """Wayback endpoints for one apex, splitting per host when one query can't.
 
     One ``*.apex`` query is cheap and enough for most apexes. When it comes
@@ -143,6 +150,12 @@ def _collect_wayback(
     hosts; when it fails, typically a wildcard too big for CDX to answer in
     time, it holds nothing. Either way the apex's live hosts are then queried
     one by one, bounded by ``max_wayback_split_hosts``.
+
+    Returns True when the apex's endpoints were LOST to source failure — the
+    apex-wide query failed and no per-host retry recovered anything (a Wayback
+    outage, as in the 503 storm that turned 494 endpoints into 5). The caller
+    leaves such an apex unfinished so ``--resume`` re-collects it, instead of
+    recording "collected, almost nothing found".
     """
     limit = collector.wayback_limit
     try:
@@ -158,30 +171,53 @@ def _collect_wayback(
     if not (truncated or failed) or not collector.wayback_split:
         if failed:
             state.problems.append(f"[{org.org_id}] wayback {cand.apex}: {failed}")
-        return
+        return bool(failed)  # apex query failed and splitting is off -> lost
 
     why = f"{limit}건 상한 도달" if truncated else f"조회 실패({failed})"
     hosts, skipped = _split_hosts(state, collector, cand, urls, resolve=resolve)
     log(f"[{org.org_id}]   wayback {cand.apex}: {why} → 호스트 {len(hosts)}개 개별 조회")
     errors = 0
+    truncated_hosts = 0
+    consecutive = 0
+    cutoff = collector.wayback_split_failure_cutoff
+    broke = False
+    tried = 0
     for i, host in enumerate(hosts, 1):
+        tried = i
         try:
             got = wayback.fetch_host_urls(http, host, limit)
         except (RequestBudgetExceeded, NetworkDown):
             raise
         except Exception:  # noqa: BLE001 - one host failing is not fatal
             errors += 1
+            consecutive += 1
+            if cutoff and consecutive >= cutoff:
+                broke = True  # Wayback is down; stop burning the retry ladder
+                break
             continue
+        consecutive = 0
+        if len(got) >= limit:
+            truncated_hosts += 1  # a single host with >limit URLs is itself cut
         _ingest(state, collector, cand, wayback.as_observations(got), "wayback")
         if i % 50 == 0:
             log(f"[{org.org_id}]   wayback 호스트별 {i}/{len(hosts)}")
 
-    note = f"[{org.org_id}] wayback {cand.apex}: {why} → 호스트 {len(hosts)}개 개별 조회"
+    unqueried = len(hosts) - tried if broke else 0
+    note = f"[{org.org_id}] wayback {cand.apex}: {why} → 호스트 {tried}/{len(hosts)}개 조회"
+    if broke:
+        note += f", 연속 {cutoff}회 실패로 중단(Wayback 장애 추정), {unqueried}개 미조회"
     if errors:
         note += f", {errors}개 실패"
+    if truncated_hosts:
+        note += f", {truncated_hosts}개 호스트는 {limit}건 상한에 재도달(일부 URL 누락)"
     if skipped:
         note += f", {skipped}개는 max_wayback_split_hosts 초과로 생략"
     state.problems.append(note)
+    # Lost when the apex query failed AND the split recovered nothing — every
+    # attempted host failed, or the breaker tripped before any succeeded. A
+    # cap-hit that the split filled in is expected partial cover, not a loss.
+    recovered = tried - errors
+    return bool(failed) and recovered <= 0
 
 
 def _collect_apex(
@@ -194,12 +230,15 @@ def _collect_apex(
     endpoints: bool,
     resolve: bool = True,
     log: Callable[[str], None] | None = None,
-) -> None:
+) -> bool:
     """crt.sh hosts, then Wayback/urlscan endpoints, for one apex into ``state``.
 
     A single source failing is recorded and the others still run; only the
     request cap and a dead network abort the apex (leaving it unfinished).
     crt.sh runs first so a Wayback split knows the apex's hosts.
+
+    Returns True when the apex's endpoint data was lost to a source outage (see
+    ``_collect_wayback``), so the caller can leave the apex for ``--resume``.
     """
     try:
         for host in crtsh.domain_search(http, cand.apex):
@@ -210,7 +249,7 @@ def _collect_apex(
         state.problems.append(f"[{org.org_id}] crt.sh %.{cand.apex}: {exc}")
 
     if not endpoints:
-        return
+        return False
     # urlscan (recent) first: its hosts also feed the Wayback split.
     if collector.urlscan_limit > 0:
         try:
@@ -221,10 +260,11 @@ def _collect_apex(
         except Exception as exc:  # noqa: BLE001
             state.problems.append(f"[{org.org_id}] urlscan {cand.apex}: {exc}")
     if collector.wayback_limit > 0:
-        _collect_wayback(
+        return _collect_wayback(
             http, org, collector, cand, state,
             resolve=resolve, log=log or (lambda _: None),
         )
+    return False
 
 
 def _finish(
@@ -306,14 +346,17 @@ def collect_org(
         say(f"[{org.org_id}] ({i}/{len(targets)}) {cand.apex} crt.sh/wayback...")
         before = http.connect_failure_total
         try:
-            _collect_apex(
+            lost = _collect_apex(
                 http, org, collector, cand, state,
                 endpoints=endpoints, resolve=resolve, log=say,
             )
         except RequestBudgetExceeded as exc:
             problems.append(f"[{org.org_id}] stopped at request cap: {exc}")
             break
-        if http.connect_failure_total != before:
+        # Leave the apex for resume when the link dropped mid-way OR a source
+        # outage lost its endpoints (503/timeout is not a connect failure, so
+        # it does not show up in connect_failure_total — hence the second test).
+        if http.connect_failure_total != before or lost:
             cut.append(cand.apex)  # keep what it got, but redo it on resume
             continue
         state.done_apexes.append(cand.apex)

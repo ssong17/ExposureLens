@@ -40,9 +40,10 @@ class NetworkDown(RuntimeError):
     """
 
 
-# Waits before each retry of a transient failure (seconds). Index outages last
-# tens of seconds, not a couple, so the ladder climbs quickly: 5 -> 15 -> 30.
-DEFAULT_RETRY_DELAYS: tuple[float, ...] = (5.0, 15.0, 30.0)
+# Waits before each retry of a transient failure (seconds). A short first wait
+# clears the common single blip fast (crt.sh 502, one 503); the ladder then
+# doubles so a real outage still backs off: 2 -> 4 -> 8 -> 16 -> 32.
+DEFAULT_RETRY_DELAYS: tuple[float, ...] = (2.0, 4.0, 8.0, 16.0, 32.0)
 
 # Requests in a row (each after exhausting its retries) that failed to connect
 # before the network is declared down.

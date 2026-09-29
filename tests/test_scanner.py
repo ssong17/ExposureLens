@@ -202,3 +202,53 @@ def test_secret_in_archived_url_keeps_full_severity():
     fs = scan_assets([_endpoint("https://x.com/a?x=AKIAABCDEFGHIJKLMNOP",
                                 freshness="archived")], min_severity="low")
     assert ("secret-aws-akid", "critical") in {(f.rule, f.severity) for f in fs}
+
+
+# ---- fix: case-sensitive structural rules (no lowercase false positives) -----
+
+def test_structural_secret_rules_are_case_sensitive():
+    ids = FindingIds("T", date="20260101")
+    # A base64/hex blob containing "akia"/"eyj" must NOT read as a real key.
+    noise = 'x = "zAkiA1bcd2Efg3hIjklm foo eyjABCDEFGH.zzzzzzzz.wwwwwwww"'
+    assert not [f for f in scan_body(
+        noise, asset={"record_id": "R", "org_id": "o", "host": "h"},
+        url="u", status="", source="s", min_severity="low", next_id=ids)
+        if f.category == "leaked-secret"]
+
+
+def test_real_uppercase_aws_key_still_flagged():
+    ids = FindingIds("T", date="20260101")
+    fs = scan_body(
+        'k="AKIAABCDEFGHIJKLMNOP"',
+        asset={"record_id": "R", "org_id": "o", "host": "h"},
+        url="u", status="", source="s", min_severity="low", next_id=ids)
+    assert any(f.rule == "body-aws-akid" for f in fs)
+
+
+# ---- fix: run-wide dedup of the same secret across bodies --------------------
+
+def test_dedup_collapses_same_secret_across_bodies():
+    ids = FindingIds("T", date="20260101")
+    dedup: dict = {}
+    body = 'api_key: "e0559a1b2c3d4e5f6a7b8c9d0e1f2a3b"'
+    a = {"record_id": "R1", "org_id": "o", "host": "h"}
+    first = scan_body(body, asset=a, url="p1", status="", source="s",
+                      min_severity="low", next_id=ids, dedup=dedup)
+    second = scan_body(body, asset=a, url="p2", status="", source="s",
+                       min_severity="low", next_id=ids, dedup=dedup)
+    assert len(first) == 1        # first body reports it
+    assert second == []           # second body's copy is suppressed
+    assert list(dedup.values())[0] == 2  # but counted
+
+
+def test_dedup_keeps_different_orgs_separate():
+    ids = FindingIds("T", date="20260101")
+    dedup: dict = {}
+    body = 'api_key: "e0559a1b2c3d4e5f6a7b8c9d0e1f2a3b"'
+    f1 = scan_body(body, asset={"record_id": "R", "org_id": "a", "host": "h"},
+                   url="u", status="", source="s", min_severity="low",
+                   next_id=ids, dedup=dedup)
+    f2 = scan_body(body, asset={"record_id": "R", "org_id": "b", "host": "h"},
+                   url="u", status="", source="s", min_severity="low",
+                   next_id=ids, dedup=dedup)
+    assert len(f1) == 1 and len(f2) == 1  # same value, two orgs -> two findings

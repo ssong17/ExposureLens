@@ -130,3 +130,14 @@ def test_failed_query_is_reported_not_treated_as_clean():
     assert not findings
     assert recorded == {}  # not saved, so a resume asks again
     assert any("조회 실패" in p for p in problems)
+
+
+def test_internetdb_strips_inferred_vulns():
+    from exposure_lens.sources import shodan
+
+    class H:
+        def get_json(self, url):
+            return {"ip": "1.1.1.1", "ports": [443], "vulns": ["CVE-2024-1"]}
+
+    rec = shodan.internetdb(H(), "1.1.1.1")
+    assert rec == {"ip": "1.1.1.1", "ports": [443]}  # vulns dropped at collection

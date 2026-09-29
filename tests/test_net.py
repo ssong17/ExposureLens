@@ -124,7 +124,7 @@ def test_body_cap_is_separate_from_response_cap():
     assert _http(max_bytes=100, max_body_bytes=9999).max_body_bytes == 100
 
 
-def test_retry_waits_climb_5_15_30(monkeypatch):
+def test_retry_waits_double_from_short_first(monkeypatch):
     waits = []
 
     def fake_urlopen(req, timeout):
@@ -132,10 +132,10 @@ def test_retry_waits_climb_5_15_30(monkeypatch):
 
     monkeypatch.setattr(net, "urlopen", fake_urlopen)
     monkeypatch.setattr(net.time, "sleep", waits.append)
-    h = _http(retry_delays=net.DEFAULT_RETRY_DELAYS)
+    h = _http(max_retries=5, retry_delays=net.DEFAULT_RETRY_DELAYS)
     with pytest.raises(urllib.error.HTTPError):
         h.get_bytes("https://crt.sh/x")
-    assert waits == [5.0, 15.0, 30.0]
+    assert waits == [2.0, 4.0, 8.0, 16.0, 32.0]
 
 
 def test_retry_past_the_ladder_reuses_its_last_rung():

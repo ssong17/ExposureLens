@@ -177,6 +177,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-resolve", action="store_true", help="skip IP/ASN resolution")
     run.add_argument("--no-endpoints", action="store_true", help="skip Wayback endpoints")
     run.add_argument(
+        "--no-archive-bodies", action="store_true",
+        help="skip the passive archived-body pass (Wayback). By default `run` "
+        "reads archived bodies to extract secrets/backend-config without "
+        "touching the target; --probe then only confirms these live and fetches "
+        "endpoints the archive lacked",
+    )
+    run.add_argument(
         "--fresh", action="store_true",
         help="discard the existing collect result instead of accumulating into it",
     )
@@ -683,10 +690,36 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
     if scan_progress:
         scan_progress.finish()
     problems.extend(sproblems)
-    write_jsonl(findings, _f(out_dir, args, "scan.jsonl"))
+
+    # Passive body pass: read ARCHIVED bodies (Wayback) — never touches the
+    # target — to pull secrets/backend-config/Supabase/Firebase that URL/host/
+    # port rules cannot see. This is part of passive extraction, so it runs even
+    # without --probe. Endpoints the archive has no snapshot for are remembered
+    # so the active pass can fetch just those.
+    archive_missed: set[str] | None = None
+    if not args.no_archive_bodies:
+        print("\npassive bodies - reading archived snapshots (Wayback; no target contact)...")
+        http.clear_cache()
+        arch = run_inspection(
+            http, asset_dicts, [], source=WAYBACK,
+            min_severity=args.min_severity, confidence=args.confidence,
+            log=_logger(args.quiet),
+        )
+        findings.extend(arch.findings)  # archive-body findings are passive candidates
+        findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
+        problems.extend(arch.problems)
+        archive_missed = set(arch.missed)
+        ac = Counter(f.severity for f in arch.findings)
+        print(
+            f"passive bodies - {len(arch.findings)} findings (critical "
+            f"{ac['critical']}, high {ac['high']}, medium {ac['medium']}, "
+            f"low {ac['low']}); {len(archive_missed)} endpoints had no snapshot"
+        )
+
+    write_jsonl(findings, _f(out_dir, args, "scan.jsonl"))  # full passive candidate set
     c = Counter(f.severity for f in findings)
     print(
-        f"scan - {len(findings)} findings (critical {c['critical']}, "
+        f"passive total - {len(findings)} findings (critical {c['critical']}, "
         f"high {c['high']}, medium {c['medium']}, low {c['low']})"
     )
     print_findings(findings, print, limit=20)
@@ -695,13 +728,24 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
         problems, orgs=app.orgs, command=args._command_str,
     )
 
-    # probe (opt-in) — the SAME active stage the `probe` command runs.
+    # probe (opt-in) — active: confirm the passive candidates live AND fetch the
+    # bodies the archive missed. When the archive pass ran, live body reads are
+    # restricted to its misses (no re-fetching what passive already covered);
+    # with --no-archive-bodies there were no misses to track, so it reads all.
     if args.probe:
-        print("\nprobe - active stage (live GETs)...")
+        print("\nprobe - active: confirm passive candidates + fetch archive misses...")
+        print(
+            "note: probe sends LIVE GETs to the target (high-confidence apexes "
+            "only; one request per endpoint/path; no new-path guessing, no "
+            "payloads).",
+            file=sys.stderr,
+        )
         http.clear_cache()
-        result = _probe_stage(
-            app, args, http, asset_dicts, [f.to_dict() for f in findings],
-            source=FETCH, min_severity=args.min_severity,
+        result = run_inspection(
+            http, asset_dicts, [f.to_dict() for f in findings],
+            source=FETCH, min_severity=args.min_severity, confidence=args.confidence,
+            restrict_body_urls=archive_missed,
+            log=_logger(args.quiet),
         )
         _write_probe_output(out_dir, args, result, app.orgs)
         problems.extend(result.problems)

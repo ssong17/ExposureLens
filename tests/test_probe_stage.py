@@ -147,3 +147,49 @@ def test_org_identity_survives_into_verification():
     confirmed = next(f for f in result.findings if f.source == "verify-confirmed")
     assert confirmed.org_name == "Seoul National University"
     assert all(f.org_name == "Seoul National University" for f in result.liveness)
+
+
+# ---- passive→active flow: archive extracts, fetch fills the gaps -------------
+
+def test_wayback_pass_records_missed_endpoints():
+    # app.js has an archive snapshot; new.js has none (returns 0/empty).
+    http = FakeHttp(
+        {"https://a.x.com/app.js": (200, "clean body", "text/javascript")}
+    )
+    result = run_inspection(
+        http,
+        [_endpoint("E1", "https://a.x.com/app.js"),
+         _endpoint("E2", "https://a.x.com/new.js")],
+        [], source=WAYBACK,
+    )
+    assert result.missed == ["https://a.x.com/new.js"]
+
+
+def test_restrict_body_urls_limits_fetch_to_the_misses():
+    bodies = {
+        "https://a.x.com/app.js": (200, 'k="AKIAABCDEFGHIJKLMNOP"', "text/javascript"),
+        "https://a.x.com/new.js": (200, 'k="AKIAZZZZZZZZZZZZZZZZ"', "text/javascript"),
+    }
+    http = FakeHttp(bodies)
+    result = run_inspection(
+        http,
+        [_endpoint("E1", "https://a.x.com/app.js"),
+         _endpoint("E2", "https://a.x.com/new.js")],
+        [], source=FETCH,
+        restrict_body_urls={"https://a.x.com/new.js"},  # only the archive miss
+    )
+    read = [u for u in http.urls if "new.js" in u or "app.js" in u]
+    assert all("new.js" in u for u in read)  # app.js (archive had it) not re-fetched
+    assert any(f.category == "leaked-secret" for f in result.findings)
+
+
+def test_empty_restrict_reads_no_bodies_but_still_verifies():
+    # archive covered everything (no misses): active does zero body reads,
+    # only verification of prior findings runs.
+    http = FakeHttp({"https://git.x.com/.git/config": (200, "[core]", "text/plain")})
+    result = run_inspection(
+        http, [_endpoint("E1", "https://a.x.com/app.js")], [_host_finding()],
+        source=FETCH, restrict_body_urls=set(),
+    )
+    assert all("app.js" not in u for u in http.urls)  # no body reads
+    assert any(f.source == "verify-confirmed" for f in result.findings)  # verify ran

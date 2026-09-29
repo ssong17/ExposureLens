@@ -37,22 +37,23 @@ config/
 user_agent = "PublicAssetResearch/0.2 (+security-research)"
 request_interval_seconds = 2.0   # 요청 간격(초), 호스트별 적용
 timeout_seconds = 30.0
-max_retries = 3
-retry_delays_seconds = [5, 15, 30]  # 재시도 전 대기(초): 1·2·3회차
+max_retries = 5
+retry_delays_seconds = [2, 4, 8, 16, 32]  # 재시도 전 대기(초): 1~5회차
 max_requests = 0                 # 0 = 무제한
 max_apex_per_org = 0             # 0 = 무제한
 max_endpoints_per_org = 0        # 0 = 무제한
-org_pause_seconds = 10.0         # 기관 사이 휴식(초)
+org_pause_seconds = 5.0          # 기관 사이 휴식(초)
 max_response_bytes = 8000000     # 색인 응답 상한
 max_body_bytes = 1000000         # 본문 규칙 대상 상한(응답 상한 이하)
 wayback_limit = 1000             # Wayback 조회 1회당 URL 상한
 wayback_split = true             # 상한 도달/실패 시 호스트별 재조회
 max_wayback_split_hosts = 300    # apex 당 호스트별 재조회 상한 (0 = 무제한)
+wayback_split_failure_cutoff = 5 # 분할 중 연속 실패 N회면 중단 (0 = 무제한)
 ```
 
 한도(`max_*`)는 0이면 무제한이며, 발견된 것을 전부 처리한다. 기관 사이에는 `org_pause_seconds`만큼 쉰다.
 
-일시적 오류(429/5xx, 연결 실패·타임아웃)는 `retry_delays_seconds` 간격으로 재시도한다. 연결 자체가 연속 3번(각각 재시도 소진 후) 실패하면 네트워크 끊김으로 보고 단계를 멈춘다(exit 3). 502 같은 서버 응답이나 읽기 타임아웃(crt.sh 지연)은 끊김으로 세지 않는다.
+일시적 오류(429/5xx, 연결 실패·타임아웃)는 `retry_delays_seconds` 간격으로 재시도한다(짧게 시작해 배로 증가, 흔한 블립을 빨리 넘긴다). 연결 자체가 연속 3번(각각 재시도 소진 후) 실패하면 네트워크 끊김으로 보고 단계를 멈춘다(exit 3). 502 같은 서버 응답이나 읽기 타임아웃(crt.sh 지연)은 끊김으로 세지 않는다.
 
 ### `[[orgs]]`
 
@@ -150,7 +151,7 @@ scan 도 IP마다 Shodan 응답을 `<시각>_scan.progress.jsonl`에 기록한�
 
 ### probe (active)
 
-아는 주소에 라이브 GET을 보낸다. high confidence apex만, 엔드포인트/경로당 한 번, 새 경로 추측·payload 없음.
+아는 주소에 라이브 GET을 보낸다. high confidence apex만, 엔드포인트/경로당 한 번, 새 경로 추측·payload 없음. 같은 경로의 쿼리 변형(`?page=1..N`)은 대표 몇 개만 읽는다(본문이 대부분 동일하므로).
 
 ```bash
 exposure-lens probe
@@ -174,13 +175,25 @@ exposure-lens probe --source wayback
 
 ### run
 
-collect → scan 을 한 번에 수행한다. `--probe`를 붙이면 probe까지.
+한 번에 수행하는 전체 파이프라인. **passive로 후보를 최대한 뽑고, `--probe`를 붙이면 active로 확인·보완**하는 흐름이다.
 
 ```bash
 exposure-lens run --all-enabled
 exposure-lens run --org snu --probe
-exposure-lens run --all-enabled --resume   # 끊긴 단계(collect 또는 scan)부터
+exposure-lens run --all-enabled --resume         # 끊긴 단계(collect 또는 scan)부터
+exposure-lens run --all-enabled --no-archive-bodies   # 아카이브 본문 패스 생략(빠름)
 ```
+
+단계:
+
+1. **collect** (passive) — 호스트·URL·포트 수집
+2. **scan** (passive) — 호스트 이름·URL·포트 규칙
+3. **아카이브 본문** (passive, 기본 실행) — Wayback 스냅샷 본문을 읽어 하드코딩 시크릿·백엔드 주소·Supabase/Firebase 설정 등 규칙만으론 못 보는 것을 추출한다. **대상에 요청하지 않는다.** 스냅샷이 없는 엔드포인트는 따로 기록해 둔다. (`--no-archive-bodies`로 생략)
+4. **probe** (active, `--probe`일 때만) — 위 passive 후보를 라이브로 **확인**(도달성·인증 없는 2xx·본문 재확인)하고, **아카이브에 스냅샷이 없던 엔드포인트만** 라이브로 읽어 passive가 못 본 것을 메운다. 아카이브가 이미 커버한 것은 다시 요청하지 않는다.
+
+즉 대량 본문 추출은 무접촉(아카이브)으로 끝내고, active 요청은 "확인 + 아카이브 누락분"으로 최소화된다. `--no-archive-bodies`면 3단계를 건너뛰고 probe가 모든 본문을 라이브로 읽는다(과거 동작).
+
+> `--probe`가 확인하는 것: API 키·Supabase/Firebase 설정 등이 **현재 서빙되는 본문에 들어 있는지**까지다. 그 자격증명이 실제로 유효한지·접근되는지는 테스트하지 않는다(active exploitation 금지).
 
 ### 기관별 순차 실행
 
@@ -194,6 +207,8 @@ RESUME=1 bash run_by_org.sh        # 끝난 기관 건너뛰고, 끊긴 기관�
 ```
 
 네트워크 끊김(exit 3)이면 남은 기관을 헛돌지 않고 그 자리에서 멈춘다. 복구 후 `RESUME=1`로 다시 실행하면 그 기관의 끊긴 단계(`collect --resume` 또는 `scan --resume`)부터 이어간다.
+
+> 같은 색인(crt.sh·Wayback)을 여러 collect가 동시에 두드리면 503/타임아웃이 늘어 서로를 느리게 만든다. collect는 한 번에 하나만 돌리는 것을 권장한다(probe는 대상 서버로, collect는 색인으로 가므로 겹쳐도 무방).
 
 환경변수: `CONFIG`(기본 config), `OUT_ROOT`(runs), `PAUSE`(30), `MIN_SEV`(low), `DO_PROBE`(0), `RESUME`(0), `ONLY`.
 
