@@ -302,6 +302,15 @@ def _logger(quiet: bool):
     return lambda m: print(m, file=sys.stderr, flush=True)
 
 
+def _severity_breakdown(findings) -> str:
+    """"critical N, high N, medium N, low N" — the count line every stage prints."""
+    c = Counter(f.severity for f in findings)
+    return (
+        f"critical {c['critical']}, high {c['high']}, "
+        f"medium {c['medium']}, low {c['low']}"
+    )
+
+
 def _report(
     out_dir: Path, http: Http | None, problems: list[str], *, code: int = 0
 ) -> int:
@@ -560,12 +569,10 @@ def _run_scan(app: AppConfig, args: argparse.Namespace) -> int:
 
     write_jsonl(findings, _f(out_dir, args, "scan.jsonl"))
 
-    counts = Counter(f.severity for f in findings)
     svc_n = sum(1 for f in findings if f.source == "shodan-internetdb")
     print(
         f"scanned {len(assets)} assets - {len(findings)} findings "
-        f"(critical {counts['critical']}, high {counts['high']}, "
-        f"medium {counts['medium']}, low {counts['low']}; {svc_n} current-service)"
+        f"({_severity_breakdown(findings)}; {svc_n} current-service)"
     )
     print_findings(findings, print)
     write_findings_summary(
@@ -575,6 +582,12 @@ def _run_scan(app: AppConfig, args: argparse.Namespace) -> int:
     return _report(out_dir, http, problems)
 
 
+_LIVE_GET_NOTE = (
+    "note: probe sends LIVE GETs to the target (high-confidence apexes only; "
+    "one request per endpoint/path; no new-path guessing, no payloads)."
+)
+
+
 def _probe_stage(
     app: AppConfig, args: argparse.Namespace, http: Http,
     assets: list[dict], prior: list[dict],
@@ -582,12 +595,7 @@ def _probe_stage(
 ):
     """The active stage, shared by the `probe` command and `run --probe`."""
     if source == FETCH:
-        print(
-            "note: probe sends LIVE GETs to the target (high-confidence apexes "
-            "only; one request per endpoint/path; no new-path guessing, no "
-            "payloads).",
-            file=sys.stderr,
-        )
+        print(_LIVE_GET_NOTE, file=sys.stderr)
     return run_inspection(
         http, assets, prior,
         source=source,
@@ -626,15 +634,73 @@ def _run_probe(app: AppConfig, args: argparse.Namespace) -> int:
     out_dir = _out_dir(args)
     _write_probe_output(out_dir, args, result, app.orgs)
 
-    counts = Counter(f.severity for f in result.findings)
     print(
         f"probed via {args.source} - {len(result.findings)} findings "
-        f"(critical {counts['critical']}, high {counts['high']}, "
-        f"medium {counts['medium']}, low {counts['low']}; "
-        f"{len(result.confirmed)} confirmed)"
+        f"({_severity_breakdown(result.findings)}; {len(result.confirmed)} confirmed)"
     )
     print_findings(result.rows, print, limit=40)
     return _report(out_dir, http, result.problems)
+
+
+def _passive_body_stage(
+    app: AppConfig, args: argparse.Namespace, http: Http,
+    assets: list[dict], findings: list, problems: list[str],
+) -> set[str] | None:
+    """Read ARCHIVED bodies (Wayback) — never touches the target — to pull
+    secrets/backend-config/Supabase/Firebase that URL/host/port rules cannot
+    see. Part of passive extraction, so it runs even without --probe; its
+    findings are appended to ``findings`` (re-sorted). Returns the set of
+    endpoint URLs the archive had no snapshot for, so the active pass can fetch
+    just those — or None when the pass is skipped (then active reads all).
+    """
+    if args.no_archive_bodies:
+        return None
+    print("\npassive bodies - reading archived snapshots (Wayback; no target contact)...")
+    http.clear_cache()
+    arch = run_inspection(
+        http, assets, [], source=WAYBACK,
+        min_severity=args.min_severity, confidence=args.confidence,
+        log=_logger(args.quiet),
+    )
+    findings.extend(arch.findings)  # archive-body findings are passive candidates
+    findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
+    problems.extend(arch.problems)
+    print(
+        f"passive bodies - {len(arch.findings)} findings "
+        f"({_severity_breakdown(arch.findings)}); "
+        f"{len(arch.missed)} endpoints had no snapshot"
+    )
+    return set(arch.missed)
+
+
+def _active_probe_stage(
+    app: AppConfig, args: argparse.Namespace, http: Http, out_dir: Path,
+    assets: list[dict], passive_findings: list, archive_missed: set[str] | None,
+    problems: list[str],
+) -> None:
+    """Active pass: confirm the passive candidates live AND fetch the bodies the
+    archive missed. When the archive pass ran, live body reads are restricted to
+    its misses (no re-fetching what passive already covered); with
+    --no-archive-bodies there were no misses to track, so it reads all.
+    """
+    print("\nprobe - active: confirm passive candidates + fetch archive misses...")
+    print(_LIVE_GET_NOTE, file=sys.stderr)
+    http.clear_cache()
+    result = run_inspection(
+        http, assets, [f.to_dict() for f in passive_findings],
+        source=FETCH, min_severity=args.min_severity, confidence=args.confidence,
+        restrict_body_urls=archive_missed,
+        log=_logger(args.quiet),
+    )
+    _write_probe_output(out_dir, args, result, app.orgs)
+    problems.extend(result.problems)
+    print(
+        f"probe - {len(result.findings)} findings, {len(result.confirmed)} confirmed"
+    )
+    print_findings(result.rows, print, limit=20)
+    rollup = liveness_rollup(result.liveness)
+    if rollup:
+        print(f"  {rollup}")
 
 
 def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
@@ -691,72 +757,20 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
         scan_progress.finish()
     problems.extend(sproblems)
 
-    # Passive body pass: read ARCHIVED bodies (Wayback) — never touches the
-    # target — to pull secrets/backend-config/Supabase/Firebase that URL/host/
-    # port rules cannot see. This is part of passive extraction, so it runs even
-    # without --probe. Endpoints the archive has no snapshot for are remembered
-    # so the active pass can fetch just those.
-    archive_missed: set[str] | None = None
-    if not args.no_archive_bodies:
-        print("\npassive bodies - reading archived snapshots (Wayback; no target contact)...")
-        http.clear_cache()
-        arch = run_inspection(
-            http, asset_dicts, [], source=WAYBACK,
-            min_severity=args.min_severity, confidence=args.confidence,
-            log=_logger(args.quiet),
-        )
-        findings.extend(arch.findings)  # archive-body findings are passive candidates
-        findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
-        problems.extend(arch.problems)
-        archive_missed = set(arch.missed)
-        ac = Counter(f.severity for f in arch.findings)
-        print(
-            f"passive bodies - {len(arch.findings)} findings (critical "
-            f"{ac['critical']}, high {ac['high']}, medium {ac['medium']}, "
-            f"low {ac['low']}); {len(archive_missed)} endpoints had no snapshot"
-        )
+    archive_missed = _passive_body_stage(app, args, http, asset_dicts, findings, problems)
 
     write_jsonl(findings, _f(out_dir, args, "scan.jsonl"))  # full passive candidate set
-    c = Counter(f.severity for f in findings)
-    print(
-        f"passive total - {len(findings)} findings (critical {c['critical']}, "
-        f"high {c['high']}, medium {c['medium']}, low {c['low']})"
-    )
+    print(f"passive total - {len(findings)} findings ({_severity_breakdown(findings)})")
     print_findings(findings, print, limit=20)
     write_findings_summary(
         _f(out_dir, args, "scan_summary.md"), f"scan - {run_date()}", findings,
         problems, orgs=app.orgs, command=args._command_str,
     )
 
-    # probe (opt-in) — active: confirm the passive candidates live AND fetch the
-    # bodies the archive missed. When the archive pass ran, live body reads are
-    # restricted to its misses (no re-fetching what passive already covered);
-    # with --no-archive-bodies there were no misses to track, so it reads all.
     if args.probe:
-        print("\nprobe - active: confirm passive candidates + fetch archive misses...")
-        print(
-            "note: probe sends LIVE GETs to the target (high-confidence apexes "
-            "only; one request per endpoint/path; no new-path guessing, no "
-            "payloads).",
-            file=sys.stderr,
+        _active_probe_stage(
+            app, args, http, out_dir, asset_dicts, findings, archive_missed, problems
         )
-        http.clear_cache()
-        result = run_inspection(
-            http, asset_dicts, [f.to_dict() for f in findings],
-            source=FETCH, min_severity=args.min_severity, confidence=args.confidence,
-            restrict_body_urls=archive_missed,
-            log=_logger(args.quiet),
-        )
-        _write_probe_output(out_dir, args, result, app.orgs)
-        problems.extend(result.problems)
-        print(
-            f"probe - {len(result.findings)} findings, "
-            f"{len(result.confirmed)} confirmed"
-        )
-        print_findings(result.rows, print, limit=20)
-        rollup = liveness_rollup(result.liveness)
-        if rollup:
-            print(f"  {rollup}")
 
     write_summary(
         _f(out_dir, args, "run_summary.md"), f"run - {run_date()}", problems,
