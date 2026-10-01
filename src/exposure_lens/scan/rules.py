@@ -124,13 +124,25 @@ HOST_RULES = _rules(
 # Matched against the path of endpoint URLs.
 PATH_RULES = _rules(
     [
+        # Secret-bearing files: dotfiles that hold credentials (.env family,
+        # .pgpass/.my.cnf/.netrc DB & login creds), private-key extensions, and
+        # Terraform state (tfstate stores every provisioned secret in cleartext).
         ("path-secret-file", "secret-file", "critical",
-         r"/(\.env|\.htpasswd|\.npmrc|\.dockercfg|id_rsa|id_dsa)(\b|$)"
-         r"|\.(pem|key|p12|pfx|keystore|ppk)$|/\.aws/credentials"),
+         r"/(\.env|\.htpasswd|\.npmrc|\.dockercfg|\.netrc|\.pgpass|\.my\.cnf"
+         r"|id_rsa|id_dsa|terraform\.tfstate)(\b|$)"
+         r"|\.(pem|key|p12|pfx|keystore|ppk|tfstate)$"
+         r"|\.tfstate\.backup$|/\.aws/credentials"),
         ("path-vcs", "vcs-exposure", "high", r"/\.(git|svn|hg)(/|$)"),
+        # Framework/app config files that carry connection strings, keys, and
+        # service wiring. Covers the profile/environment variants real stacks
+        # ship: Spring application-<profile>.yml, .NET appsettings.<env>.json,
+        # docker-compose.<env>.yml, Rails database.yml, Azure local.settings.json.
         ("path-config", "config-exposure", "high",
-         r"/(wp-config\.php|config\.(json|ya?ml|php|xml)|settings\.py"
-         r"|application\.(properties|ya?ml)|web\.config|\.git-credentials)(\b|$)"),
+         r"/(wp-config\.php|config\.(json|ya?ml|php|xml|ini)|settings\.py"
+         r"|application(?:-[\w.-]+)?\.(properties|ya?ml)"
+         r"|appsettings(?:\.[\w-]+)?\.json|local\.settings\.json"
+         r"|docker-compose(?:\.[\w.-]+)?\.ya?ml|database\.yml"
+         r"|web\.config|\.git-credentials|\.aws/config)(\b|$)"),
         # Database dumps and editor/backup copies of real files. The copy
         # suffixes only count after a real extension (index.php.bak), so a page
         # named "old" or a product called "dump" does not match.

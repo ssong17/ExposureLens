@@ -123,10 +123,11 @@ def _add_resume(parser: argparse.ArgumentParser) -> None:
 
 def _add_vibe(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--vibe", action="store_true",
-        help="also fingerprint AI site builders (Lovable, v0, Replit, Base44, "
-        "Manus, Claude) from host names and served bodies — low-severity "
-        "'vibe-platform' findings",
+        "--no-vibe", dest="vibe", action="store_false",
+        help="turn OFF AI site-builder fingerprinting (Lovable, v0, Replit, "
+        "Base44, Manus, Claude). On by default; emits low-severity "
+        "'vibe-platform' findings from host names and served bodies (shown only "
+        "at --min-severity low, since platform attribution is not an exposure)",
     )
 
 
