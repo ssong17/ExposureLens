@@ -13,9 +13,8 @@ from urllib.error import HTTPError
 from ..core.net import Http
 
 # InternetDB's ``vulns`` are CVEs *inferred* from version banners ("this version
-# is associated with CVE-X"), not confirmed exploitable. We never report them,
-# and dropping the field here means it also never lands in the scan progress
-# file — nothing downstream keeps a list of maybe-CVEs we cannot stand behind.
+# is associated with CVE-X"), not confirmed exploitable. We do not report them,
+# and dropping the field here means it never lands in the scan progress file.
 _DROP_FIELDS = ("vulns",)
 
 

@@ -34,6 +34,8 @@ from .rules import (
     PUBLIC_BROWSER_KEY,
     SECRET_RULES,
 )
+from .vibe_rules import detect_body as vibe_detect_body
+from .vibe_rules import detect_host as vibe_detect_host
 
 # Only credential-bearing categories are masked; a route/URL/authz-check IS the
 # finding, so it is kept verbatim (just length-capped).
@@ -135,7 +137,7 @@ def _mask_match(value: str) -> str:
 
 
 def scan_assets(
-    assets: Iterable[dict], *, min_severity: str = "medium"
+    assets: Iterable[dict], *, min_severity: str = "medium", vibe: bool = False
 ) -> list[Finding]:
     limit = SEVERITY_ORDER[min_severity]
     findings: list[Finding] = []
@@ -165,6 +167,15 @@ def scan_assets(
                         sev = downgrade(sev)
                     ev = f"{host} (dns-unresolved)" if dead_host else host
                     matches.append((rule.id, rule.category, sev, ev, host_url, "/"))
+            if vibe:
+                # Vibe-coding platform fingerprints by hostname (free; domain
+                # signatures). Attribution, so low severity.
+                for sig in vibe_detect_host(host):
+                    matches.append((
+                        f"vibe-{sig.name}", "vibe-platform", "low",
+                        f"{sig.platform}: {sig.description} ({sig.confidence})",
+                        host_url, "/",
+                    ))
         elif asset_type == "endpoint" and url:
             path = urlsplit(url).path
             # Only Wayback knows this URL: it existed once, which is a lead for
@@ -240,6 +251,7 @@ def scan_body(
     next_id,
     freshness: str = "",
     dedup: "dict[tuple[str, str, str], int] | None" = None,
+    vibe: bool = False,
 ) -> list[Finding]:
     """Apply CONTENT_RULES/CLIENT_RULES to one response body already fetched.
 
@@ -305,6 +317,34 @@ def scan_body(
                     host=host,
                     url=url,
                     evidence=evidence,
+                    discovered_at=timestamp_now(),
+                    path=path,
+                    status=status,
+                    source=source,
+                    freshness=freshness,
+                )
+            )
+
+    if vibe:
+        # Vibe-coding platform fingerprints in the served body (html/js
+        # signatures). Attribution → low severity, not masked.
+        for sig in vibe_detect_body(text):
+            key = (f"vibe-{sig.name}", sig.platform)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(
+                Finding(
+                    finding_id=next_id(),
+                    org_id=org_id,
+                    asset_ref=record_id,
+                    org_name=asset.get("org_name", ""),
+                    severity="low",
+                    category="vibe-platform",
+                    rule=f"vibe-{sig.name}",
+                    host=host,
+                    url=url,
+                    evidence=f"{sig.platform}: {sig.description} ({sig.confidence})",
                     discovered_at=timestamp_now(),
                     path=path,
                     status=status,

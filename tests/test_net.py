@@ -197,3 +197,4 @@ def test_success_resets_the_connect_failure_streak(monkeypatch):
             h.get_bytes("https://crt.sh/x")
         except urllib.error.URLError:
             pass  # never NetworkDown: the success in the middle reset it
+

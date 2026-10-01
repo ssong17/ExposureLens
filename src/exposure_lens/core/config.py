@@ -41,20 +41,18 @@ class CollectorConfig:
     # the first few hundred KB, and the old shared 30MB cap meant one probe could
     # pull 30MB into memory and run every regex over it.
     max_body_bytes: int = 1_000_000
-    # Per-apex fetch limits, previously hard-coded at the call sites so raising
-    # max_endpoints_per_org above ~1100/apex had no effect.
-    wayback_limit: int = 1000
     urlscan_limit: int = 100
-    # When one *.apex Wayback query comes back full (wayback_limit rows, which
-    # CDX fills with the alphabetically-first hosts only) or fails outright,
-    # re-query that apex's live hosts one by one. Capped per apex (0 = unlimited)
-    # because each host is one request at request_interval_seconds.
-    wayback_split: bool = True
-    max_wayback_split_hosts: int = 300
-    # Circuit breaker: after this many host queries fail in a row during a
-    # split, stop — Wayback is down, not this host, and each failed host costs
-    # the full retry ladder (~50s). 0 = never break.
-    wayback_split_failure_cutoff: int = 5
+    # Per-apex cap for search-engine discovery (--search). 0 keeps it off even
+    # when the flag is set; API keys come from env (see sources.search).
+    search_limit: int = 20
+    # Search queries (templates with {apex}, or bare keywords wrapped as
+    # site:apex "kw"). Empty = sources.search.DEFAULT_QUERIES. Override per
+    # target to hunt specific terms (관리자, 백업, a CMS name, ...).
+    search_queries: tuple[str, ...] = ()
+    # Wayback is swept with CDX pagination (every subdomain, no 1000-row gap).
+    # This caps how many pages one apex may pull (0 = all pages). Pagination
+    # already keeps request counts low, so the default pulls everything.
+    wayback_max_pages: int = 0
     # Bounded parsed-JSON cache (entries).
     cache_entries: int = 128
 
@@ -190,15 +188,11 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         resolve_timeout=_num("resolve_timeout", float, CollectorConfig.resolve_timeout),
         resolve_workers=_num("resolve_workers", int, CollectorConfig.resolve_workers),
-        wayback_limit=_num("wayback_limit", int, CollectorConfig.wayback_limit),
         urlscan_limit=_num("urlscan_limit", int, CollectorConfig.urlscan_limit),
-        wayback_split=bool(c.get("wayback_split", CollectorConfig.wayback_split)),
-        max_wayback_split_hosts=_num(
-            "max_wayback_split_hosts", int, CollectorConfig.max_wayback_split_hosts
-        ),
-        wayback_split_failure_cutoff=_num(
-            "wayback_split_failure_cutoff", int,
-            CollectorConfig.wayback_split_failure_cutoff,
+        search_limit=_num("search_limit", int, CollectorConfig.search_limit),
+        search_queries=tuple(str(q) for q in c.get("search_queries", [])),
+        wayback_max_pages=_num(
+            "wayback_max_pages", int, CollectorConfig.wayback_max_pages
         ),
         cache_entries=_num("cache_entries", int, CollectorConfig.cache_entries),
     )
@@ -256,12 +250,8 @@ def validate_config(app: AppConfig) -> None:
         raise ValueError("max_endpoint_variants_per_path는 0 이상이어야 합니다 (0 = 무제한).")
     if col.org_pause_seconds < 0:
         raise ValueError("org_pause_seconds는 0 이상이어야 합니다.")
-    if col.wayback_limit < 0 or col.urlscan_limit < 0:
-        raise ValueError("wayback_limit과 urlscan_limit은 0 이상이어야 합니다.")
-    if col.max_wayback_split_hosts < 0:
-        raise ValueError("max_wayback_split_hosts는 0 이상이어야 합니다 (0 = 무제한).")
-    if col.wayback_split_failure_cutoff < 0:
-        raise ValueError("wayback_split_failure_cutoff는 0 이상이어야 합니다 (0 = 무제한).")
+    if col.urlscan_limit < 0 or col.search_limit < 0 or col.wayback_max_pages < 0:
+        raise ValueError("urlscan_limit·search_limit·wayback_max_pages는 0 이상이어야 합니다.")
     if col.cache_entries < 0:
         raise ValueError("cache_entries는 0 이상이어야 합니다.")
     if col.resolve_timeout <= 0 or col.resolve_workers < 1:

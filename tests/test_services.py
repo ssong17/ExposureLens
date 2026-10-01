@@ -140,4 +140,5 @@ def test_internetdb_strips_inferred_vulns():
             return {"ip": "1.1.1.1", "ports": [443], "vulns": ["CVE-2024-1"]}
 
     rec = shodan.internetdb(H(), "1.1.1.1")
-    assert rec == {"ip": "1.1.1.1", "ports": [443]}  # vulns dropped at collection
+    assert rec == {"ip": "1.1.1.1", "ports": [443]}  # vulns not reported
+

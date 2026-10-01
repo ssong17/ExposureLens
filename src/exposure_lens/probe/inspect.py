@@ -104,6 +104,48 @@ def _is_script_like(url: str) -> bool:
     return ext in _SCRIPT_EXT
 
 
+# Static assets: a 2xx on one of these is the server returning a file, never a
+# gate falling open. ``authz-open`` is about a protected PAGE answering, so a
+# .js/.css/.map named ".../internal/foo.js" must not count as broken access.
+_STATIC_ASSET_EXT = {
+    "js", "mjs", "cjs", "css", "map", "json", "ico", "svg", "png", "jpg",
+    "jpeg", "gif", "webp", "woff", "woff2", "ttf", "eot", "otf",
+}
+
+
+def _is_static_asset(url: str) -> bool:
+    tail = urlsplit(url).path.rsplit("/", 1)[-1]
+    ext = tail.rsplit(".", 1)[-1].lower() if "." in tail else ""
+    return ext in _STATIC_ASSET_EXT
+
+
+# A 200 page that shows a login form means authentication IS enforced — the
+# gate is working, so it must NOT be reported as "open without auth".
+_LOGIN_MARKERS = re.compile(
+    r"""(?ix)
+    type\s*=\s*["']password["']      # a password input
+    | name\s*=\s*["']password["']
+    | \b(로그인|로그인하기|login|log\s*in|sign\s*in|signin)\b
+    | \bauthenticat
+    """,
+)
+
+
+def _looks_like_login(text: str) -> bool:
+    return bool(_LOGIN_MARKERS.search(text[:20000]))
+
+
+def _looks_like(length: int, catch_all_length: int) -> bool:
+    """True when a body is close enough to the host's catch-all page to be it.
+
+    Exact-match SPAs serve byte-identical index.html for every path; soft-404
+    pages vary a little, so allow a small tolerance.
+    """
+    if catch_all_length == 0:
+        return length == 0
+    return abs(length - catch_all_length) <= max(64, catch_all_length // 20)
+
+
 # Keep at most this many query-string variants of one (host, path). The 455
 # `?page=1..N` copies of one template all serve the same body, so probing every
 # one cost ~4h and (before dedup) reported the same secret hundreds of times. A
@@ -178,6 +220,7 @@ def inspect_assets(
     next_id: "Callable[[], str] | None" = None,
     dedup: "dict[tuple[str, str, str], int] | None" = None,
     missed_out: "list[str] | None" = None,
+    vibe: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> tuple[list[Finding], list[str]]:
     """Body-reading half of the active stage. ``source`` is WAYBACK or FETCH.
@@ -201,6 +244,12 @@ def inspect_assets(
 
     body_source = "fetch-body" if source == FETCH else "wayback-body"
     findings: list[Finding] = []
+    # host -> homepage body length (-1 if "/" did not answer 2xx). An SPA/catch-
+    # all serves the same index for every route, so a discovered path whose body
+    # matches the homepage is the index fallback, not that path's content. "/"
+    # is a real path, so this keeps the "never guess paths" guarantee. Computed
+    # once per host on the FETCH pass.
+    home_len: dict[str, int] = {}
     say(f"inspecting {len(targets)} endpoints via {source}...")
 
     for i, asset in enumerate(targets, 1):
@@ -220,6 +269,24 @@ def inspect_assets(
         if source == WAYBACK and not text and missed_out is not None:
             missed_out.append(url)
 
+        # Did this 2xx really serve THIS path's content? On an SPA/catch-all the
+        # homepage is returned for every route, so an archived path that now just
+        # renders the index is not a current hit. Compare the body to the host
+        # root ("/"); a match means it is the index fallback (soft-404).
+        trust_2xx = True
+        path = urlsplit(url).path or "/"
+        if source == FETCH and 200 <= status < 300 and path != "/":
+            host = urlsplit(url).hostname or ""
+            if host not in home_len:
+                try:
+                    hstatus, hlen = body_src.home_body(http, url)
+                except RequestBudgetExceeded as exc:
+                    problems.append(f"stopped at request cap: {exc}")
+                    break
+                home_len[host] = hlen if 200 <= hstatus < 300 else -1
+            if home_len[host] >= 0 and _looks_like(len(text), home_len[host]):
+                trust_2xx = False  # just the host's index page, not this path
+
         # A direct fetch always yields a liveness signal; record it even when the
         # body is clean so the report can rank live exposures above stale ones.
         if source == FETCH:
@@ -228,11 +295,19 @@ def inspect_assets(
                                       source="fetch-status")
             )
 
-        # Authorization gap: a should-be-protected path that answers 2xx.
-        if source == FETCH and 200 <= status < 300 and AUTHZ_PATH.search(url):
+        # Authorization gap: a should-be-protected path that answers 2xx with its
+        # REAL content and no auth. Excluded: static assets (a .js answering 200
+        # is not broken access control), the index fallback (not real content),
+        # and a login/challenge PAGE (200 showing a login form means auth IS
+        # enforced — that is the gate working, not an open door).
+        if (source == FETCH and trust_2xx and 200 <= status < 300
+                and not _is_static_asset(url) and AUTHZ_PATH.search(url)
+                and not _looks_like_login(text)):
             findings.append(_authz_finding(asset, url, status, next_id))
 
-        if not text:
+        # A soft-404 / index-fallback body is not this URL's content, so running
+        # secret/content rules on it only re-finds the homepage. Skip.
+        if not text or (source == FETCH and not trust_2xx):
             continue
         # A body we just fetched is being served now; an archived snapshot is not.
         body_freshness = "current" if source == FETCH else "archived"
@@ -247,6 +322,7 @@ def inspect_assets(
                 next_id=next_id,
                 freshness=body_freshness,
                 dedup=dedup,
+                vibe=vibe,
             )
         )
 
@@ -272,6 +348,7 @@ def inspect_assets(
                         next_id=next_id,
                         freshness=body_freshness,
                         dedup=dedup,
+                        vibe=vibe,
                     )
                 )
 
@@ -312,6 +389,7 @@ def run_inspection(
     scripts_only: bool = False,
     only_findings: bool = False,
     restrict_body_urls: set[str] | None = None,
+    vibe: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> InspectionResult:
     """The whole active stage: body inspection + finding verification.
@@ -349,7 +427,7 @@ def run_inspection(
         http, assets, source=source, min_severity=min_severity,
         finding_urls=finding_urls, max_targets=max_targets,
         scripts_only=scripts_only, next_id=next_id, dedup=dedup,
-        missed_out=result.missed if source == WAYBACK else None, log=log,
+        missed_out=result.missed if source == WAYBACK else None, vibe=vibe, log=log,
     )
     result.problems.extend(problems)
 
@@ -360,7 +438,7 @@ def run_inspection(
         ver, vproblems = verify_findings(
             http, prior_findings, assets_by_id, min_severity=min_severity,
             confidence=confidence, max_targets=max_targets,
-            next_id=next_id, dedup=dedup, log=log,
+            next_id=next_id, dedup=dedup, vibe=vibe, log=log,
         )
         rows.extend(ver)
         result.problems.extend(vproblems)

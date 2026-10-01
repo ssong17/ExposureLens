@@ -193,3 +193,89 @@ def test_empty_restrict_reads_no_bodies_but_still_verifies():
     )
     assert all("app.js" not in u for u in http.urls)  # no body reads
     assert any(f.source == "verify-confirmed" for f in result.findings)  # verify ran
+
+
+# ---- #1: soft-404 / SPA catch-all must not become "current exposure" ---------
+
+class CatchAllHttp:
+    """A host that answers 200 with the same index page for ANY path (SPA)."""
+    max_requests = 1000
+    max_body_bytes = 1_000_000
+
+    def __init__(self, page="<html>index</html>"):
+        self.page = page
+        self.request_count = 0
+        self.urls = []
+
+    def probe(self, url):
+        self.request_count += 1
+        self.urls.append(url)
+        return 200, self.page, "text/html", ""
+
+
+def test_catch_all_200_is_not_flagged_as_authz_open():
+    http = CatchAllHttp()
+    # an admin-ish path on an SPA that 200s everything
+    res = run_inspection(
+        http, [_endpoint("E1", "https://a.x.com/admin/")], [], source=FETCH,
+    )
+    assert not any(f.category == "access-control" for f in res.findings)
+    # liveness still recorded, but no exposure
+    assert any(f.category == "liveness" for f in res.liveness)
+
+
+def test_catch_all_body_rules_are_skipped():
+    # the catch-all page contains a secret-shaped string; must NOT be reported
+    # because the body is the host's generic page, not this URL's content.
+    page = 'x="AKIAABCDEFGHIJKLMNOP"'
+    http = CatchAllHttp(page=page)
+    res = run_inspection(
+        http, [_endpoint("E1", "https://a.x.com/app.js")], [], source=FETCH,
+    )
+    assert not any(f.category == "leaked-secret" for f in res.findings)
+
+
+def test_static_js_on_internal_path_is_not_authz_open():
+    bodies = {"https://a.x.com/internal/foo.js": (200, "console.log(1)", "text/javascript")}
+    http = FakeHttp(bodies)
+    res = run_inspection(
+        http, [_endpoint("E1", "https://a.x.com/internal/foo.js")], [], source=FETCH,
+    )
+    assert not any(f.category == "access-control" for f in res.findings)
+
+
+def test_genuine_distinct_page_on_catch_all_host_still_inspected():
+    # Host 200s a short index for bogus, but this real page is clearly different
+    # (much longer) and carries a secret -> must still be found.
+    class MixedHttp(CatchAllHttp):
+        def probe(self, url):
+            self.request_count += 1
+            from urllib.parse import urlsplit
+            if (urlsplit(url).path or "/") == "/":
+                return 200, "idx", "text/html", ""   # short homepage baseline
+            return 200, 'k="AKIAABCDEFGHIJKLMNOP"' + "x" * 500, "text/html", ""
+    http = MixedHttp()
+    res = run_inspection(
+        http, [_endpoint("E1", "https://a.x.com/config")], [], source=FETCH,
+    )
+    assert any(f.category == "leaked-secret" for f in res.findings)
+
+
+def test_login_page_on_admin_path_is_not_open_without_auth():
+    # /admin returns 200 but it's a login FORM -> auth is enforced, not an open door.
+    bodies = {"https://a.x.com/admin/": (200, '<form><input type="password"></form>', "text/html")}
+    http = FakeHttp(bodies)
+    res = run_inspection(
+        http, [_endpoint("E1", "https://a.x.com/admin/")], [], source=FETCH,
+    )
+    assert not any(f.category == "access-control" for f in res.findings)
+
+
+def test_admin_content_without_login_is_open_without_auth():
+    # /admin returns 200 with real admin content (no login form) -> genuine breach.
+    bodies = {"https://a.x.com/admin/": (200, "<h1>Admin Dashboard</h1><table>users</table>", "text/html")}
+    http = FakeHttp(bodies)
+    res = run_inspection(
+        http, [_endpoint("E1", "https://a.x.com/admin/")], [], source=FETCH,
+    )
+    assert any(f.category == "access-control" for f in res.findings)

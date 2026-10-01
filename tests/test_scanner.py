@@ -254,3 +254,35 @@ def test_dedup_keeps_different_orgs_separate():
                    url="u", status="", source="s", min_severity="low",
                    next_id=ids, dedup=dedup)
     assert len(f1) == 1 and len(f2) == 1  # same value, two orgs -> two findings
+
+
+# ---- #6: CMS/admin discovery (path patterns + content signature) -------------
+
+def test_cms_admin_paths_are_flagged():
+    for path in ("/administrator/index.php", "/manager/html", "/user/login",
+                 "/adm/", "/wp-login.php"):
+        rules = _rules_for(f"https://x.com{path}")
+        assert any(r[0] in ("path-admin", "path-cms-admin") for r in rules), path
+
+
+def test_ordinary_paths_are_not_cms_admin():
+    assert not _rules_for("https://x.com/bbs/list")
+    assert not _rules_for("https://x.com/news/admin-tips/")
+
+
+def test_admin_panel_detected_by_page_title():
+    ids = FindingIds("T", date="20260101")
+    fs = scan_body("<html><head><title>관리자 로그인</title></head></html>",
+                   asset={"record_id": "R", "org_id": "o", "host": "h"},
+                   url="https://h/x", status="200", source="fetch-body",
+                   min_severity="low", next_id=ids)
+    assert any(f.rule == "body-admin-panel" and f.category == "admin-panel" for f in fs)
+
+
+def test_normal_page_title_is_not_admin_panel():
+    ids = FindingIds("T", date="20260101")
+    fs = scan_body("<title>회사소개</title>",
+                   asset={"record_id": "R", "org_id": "o", "host": "h"},
+                   url="https://h/x", status="200", source="fetch-body",
+                   min_severity="low", next_id=ids)
+    assert not any(f.rule == "body-admin-panel" for f in fs)

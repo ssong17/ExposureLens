@@ -52,11 +52,20 @@ def test_liveness_rollup_orders_by_triage_value():
     assert rollup.index("인증필요 1") < rollup.index("응답없음 1")
 
 
-def test_severity_lists_are_capped():
+def test_medium_low_lists_are_capped():
+    # medium/low are candidates/noise -> capped to keep the file readable.
+    rows = [_f(severity="medium", category="admin-panel", rule="path-admin",
+               url=f"https://h/{i}") for i in range(MAX_BULLETS_PER_SEVERITY + 10)]
+    body = "\n".join(findings_summary_lines("t", rows))
+    assert "외 10건" in body
+
+
+def test_critical_high_lists_are_never_capped():
+    # a leaked credential must never vanish past a bullet cap.
     rows = [_f(url=f"https://h/{i}") for i in range(MAX_BULLETS_PER_SEVERITY + 10)]
     body = "\n".join(findings_summary_lines("t", rows))
-    assert body.count("[유출된 자격증명]") == MAX_BULLETS_PER_SEVERITY
-    assert "외 10건" in body
+    assert body.count("[유출된 자격증명]") == MAX_BULLETS_PER_SEVERITY + 10
+    assert "외 " not in body
 
 
 def test_freshness_tag_is_rendered():

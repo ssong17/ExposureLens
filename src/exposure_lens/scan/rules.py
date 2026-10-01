@@ -153,6 +153,14 @@ PATH_RULES = _rules(
         # (AUTHZ_PATH) checks. Surface only, hence low.
         ("path-admin", "admin-panel", "low",
          r"/(admin|wp-admin|phpmyadmin|administrator)(/|$)"),
+        # Recognisable CMS / app admin entry points beyond the generic /admin —
+        # these are the panels a "site:x 관리자" search typically surfaces. Low
+        # (a route name is a candidate; probe confirms if it answers 2xx).
+        ("path-cms-admin", "admin-panel", "low",
+         r"/(wp-login\.php|wp-admin/|administrator/index\.php|manager/html"
+         r"|typo3/|bitrix/admin|umbraco(/|$)|ghost/|backoffice(/|$)"
+         r"|user/login|users/sign_in|adm/login|_admin(/|$)|cms/login)"
+         r"|/(adm|manage|gnuboard|rhymix|xe)/"),
         ("path-api", "api-surface", "low",
          r"/(swagger|openapi\.(json|ya?ml)|api-docs|graphql)(/|$|\.)"),
     ]
@@ -235,6 +243,13 @@ CONTENT_RULES = _rules(
          r"(?i)bearer\s+[A-Za-z0-9._~+/-]{20,}=*"),
         ("body-basic-auth", "leaked-secret", "high",
          r"(?i)authorization[\"']?\s*[:=]\s*[\"']?basic\s+[A-Za-z0-9+/]{16,}={0,2}"),
+        # Admin/CMS login panel detected by PAGE CONTENT (not the URL) — this is
+        # what a `site:x "관리자"` search finds: a management page whose address
+        # is unremarkable but whose title says it is an admin/login console.
+        # High-signal (the title itself), low severity (candidate; not masked).
+        ("body-admin-panel", "admin-panel", "low",
+         r"(?i)<title>[^<]*(관리자|관리자\s*로그인|admin\s*login|administrator\s*login"
+         r"|cms\s*login|back\s*office|관리\s*시스템)[^<]*</title>"),
     ]
 )
 
@@ -391,6 +406,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "backend-config": "백엔드 설정 노출(주소·인증방식)",
     "sourcemap": "소스맵(원본 복원 가능)",
     # network-level and live-checked facts
+    "vibe-platform": "바이브코딩 플랫폼(빌더 식별)",
     "sensitive-host": "민감 호스트(이름 기반 후보)",
     "exposed-service": "열린 서비스 포트",
     "shared-service": "열린 포트(공유 IP·귀속 미확정)",

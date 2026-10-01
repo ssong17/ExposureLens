@@ -29,10 +29,10 @@ def test_defaults_split_index_and_body_caps():
 def test_source_limits_are_configurable(tmp_path):
     app = load_config(_write(tmp_path, """
 [collector]
-wayback_limit = 5000
+wayback_max_pages = 10
 urlscan_limit = 300
 """ + BASE))
-    assert app.collector.wayback_limit == 5000
+    assert app.collector.wayback_max_pages == 10
     assert app.collector.urlscan_limit == 300
 
 

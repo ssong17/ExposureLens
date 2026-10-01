@@ -46,10 +46,9 @@ max_endpoint_variants_per_path = 5  # 같은 (호스트,경로) 쿼리 변형 �
 org_pause_seconds = 5.0          # 기관 사이 휴식(초)
 max_response_bytes = 8000000     # 색인 응답 상한
 max_body_bytes = 1000000         # 본문 규칙 대상 상한(응답 상한 이하)
-wayback_limit = 1000             # Wayback 조회 1회당 URL 상한
-wayback_split = true             # 상한 도달/실패 시 호스트별 재조회
-max_wayback_split_hosts = 300    # apex 당 호스트별 재조회 상한 (0 = 무제한)
-wayback_split_failure_cutoff = 5 # 분할 중 연속 실패 N회면 중단 (0 = 무제한)
+wayback_max_pages = 40           # Wayback CDX 페이지네이션: apex당 최대 페이지 (0=전부)
+search_limit = 20                # --search 시 apex당 검색결과 상한 (키 없으면 무동작)
+# search_queries = ["관리자", "백업"]  # (선택) --search 기본 쿼리 덮어쓰기. 키워드는 site:apex "kw"로
 ```
 
 한도(`max_*`)는 0이면 무제한이며, 발견된 것을 전부 처리한다. 기관 사이에는 `org_pause_seconds`만큼 쉰다.
@@ -101,7 +100,8 @@ exposure-lens collect --all-enabled
 - apex 발견: crt.sh 조직 검색, 동명 타 기관은 confidence로 격리
 - 서브도메인: crt.sh + Wayback
 - 엔드포인트: Wayback(과거) + urlscan.io(최근)
-  - Wayback은 apex 단위(`*.apex`)로 한 번 조회한다. 결과는 호스트 알파벳 순이라, `wayback_limit`에 꽉 차면 앞쪽 호스트만 담기고 뒤쪽 서브도메인은 빠진다. 꽉 찼거나 조회가 실패하면(큰 와일드카드의 타임아웃) 그 apex의 **지금 해석되는 호스트**를 하나씩 다시 조회한다(apex 당 `max_wayback_split_hosts`개까지, 이미 온전히 받은 호스트는 제외). 몇 개를 조회했는지·생략했는지는 summary의 Problems에 남는다
+  - Wayback은 apex 단위(`*.apex`)를 **CDX 페이지네이션**으로 훑는다(`showNumPages`로 페이지 수를 받고 `page=0..N-1` 순회). 결과가 호스트 알파벳 순이라 1회 조회로 1000건에서 자르면 뒤쪽 서브도메인이 빠지는데, 페이지네이션은 **모든 서브도메인의 모든 경로**를 적은 요청으로 받는다(대부분 1~5페이지, `wayback_max_pages`로 상한). 조회가 실패하면 그 apex는 미완료로 남아 `--resume` 시 재수집된다
+  - 게시글·목록처럼 **숫자만 다른 경로(`/news/pr/1`,`/2`…)와 쿼리 변형(`?page=`)은 "틀"로 묶어** `max_endpoint_variants_per_path`개만 저장(전수 저장 방지)
 - IP: 시스템 DNS 해석 / ASN: Team Cymru
 
 | 옵션 | 설명 |
@@ -183,6 +183,10 @@ exposure-lens run --all-enabled
 exposure-lens run --org snu --probe
 exposure-lens run --all-enabled --resume         # 끊긴 단계(collect 또는 scan)부터
 exposure-lens run --all-enabled --no-archive-bodies   # 아카이브 본문 패스 생략(빠름)
+exposure-lens run --all-enabled --vibe                 # AI 빌더(Lovable·v0·Replit 등) 핑거프린트 추가
+exposure-lens run --all-enabled                       # 검색 발견은 기본 on (키 있을 때만 실제 동작)
+exposure-lens run --all-enabled --no-search           # 검색 발견 끄기
+exposure-lens run --all-enabled --search-query 관리자 --search-query 백업  # 키워드 추가 지정
 ```
 
 단계:

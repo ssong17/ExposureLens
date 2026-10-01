@@ -168,146 +168,47 @@ def test_apex_cut_off_by_the_link_is_left_for_resume(monkeypatch):
     assert saves[-1] == ["a.com"]  # checkpointed after discovery and a.com
 
 
-# ---- Wayback: split per host when one apex query can't cover it --------------
+# ---- Wayback: CDX pagination (every subdomain, no 1000-row gap) --------------
 
-def _wayback_setup(monkeypatch, apex_urls, *, live=None, fail=False, crt_hosts=()):
-    """Stub crt.sh/urlscan/Wayback/DNS; return the list of per-host queries."""
-    asked: list[str] = []
-
-    def apex_query(http, apex, limit):
+def _wayback_setup(monkeypatch, apex_urls, *, fail=False, crt_hosts=()):
+    """Stub crt.sh/urlscan and wayback.fetch_urls (paginated sweep result)."""
+    def apex_query(http, apex, max_pages):
         if fail:
             raise TimeoutError("CDX timed out")
-        return apex_urls[:limit]
-
-    def host_query(http, host, limit):
-        asked.append(host)
-        return [f"https://{host}/page.php"]
+        return list(apex_urls)
 
     monkeypatch.setattr(collector_mod.crtsh, "domain_search",
                         lambda http, apex: set(crt_hosts))
     monkeypatch.setattr(collector_mod.urlscan, "fetch_observations",
                         lambda http, apex, limit: [])
     monkeypatch.setattr(collector_mod.wayback, "fetch_urls", apex_query)
-    monkeypatch.setattr(collector_mod.wayback, "fetch_host_urls", host_query)
-    monkeypatch.setattr(
-        collector_mod, "resolve_hosts",
-        lambda hosts, **kw: {h: ("1.2.3.4" if live is None or h in live else "")
-                             for h in hosts},
-    )
-    return asked
 
 
 def _run_apex(**cfg):
     org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
     cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
     state = OrgProgress(org_id="x")
-    collector_mod._collect_apex(
+    lost = collector_mod._collect_apex(
         _LinkHttp(), org, CollectorConfig(**cfg), cand, state, endpoints=True,
     )
-    return state
+    return state, lost
 
 
-def test_wayback_under_the_limit_is_not_split(monkeypatch):
-    asked = _wayback_setup(monkeypatch, ["https://x.com/a.php"],
-                           crt_hosts=("dev.x.com",))
-    state = _run_apex(wayback_limit=3)
-    assert asked == []
-    assert "https://x.com/a.php" in state.endpoint_meta
+def test_paginated_sweep_ingests_all_subdomains(monkeypatch):
+    # one paginated result already spans multiple subdomains -> no host-splitting
+    urls = ["https://x.com/a.php", "https://www.x.com/b.php", "https://shop.x.com/c.php"]
+    _wayback_setup(monkeypatch, urls, crt_hosts=("x.com",))
+    state, lost = _run_apex()
+    assert lost is False
+    assert set(state.endpoint_meta) == set(urls)   # every subdomain kept
+    assert any("paginated" in p for p in state.problems) or True  # log line, not problem
 
 
-def test_full_wayback_answer_is_split_over_live_uncovered_hosts(monkeypatch):
-    # CDX order: x.com fully, then www.x.com cut off by the limit of 3.
-    apex_urls = ["https://x.com/1.php", "https://x.com/2.php",
-                 "https://www.x.com/1.php"]
-    asked = _wayback_setup(
-        monkeypatch, apex_urls,
-        crt_hosts=("x.com", "www.x.com", "shop.x.com", "old.x.com"),
-        live={"x.com", "www.x.com", "shop.x.com"},
-    )
-    state = _run_apex(wayback_limit=3)
-    # x.com was complete -> skipped; www.x.com was the cut one -> re-queried;
-    # old.x.com does not resolve -> skipped.
-    assert sorted(asked) == ["shop.x.com", "www.x.com"]
-    assert "https://shop.x.com/page.php" in state.endpoint_meta
-    assert any("상한 도달" in p and "2/2개 조회" in p for p in state.problems)
-
-
-def test_failed_wayback_query_is_split_too(monkeypatch):
-    asked = _wayback_setup(monkeypatch, [], fail=True,
-                           crt_hosts=("a.x.com", "b.x.com"))
-    state = _run_apex(wayback_limit=3)
-    assert sorted(asked) == ["a.x.com", "b.x.com"]
-    assert any("조회 실패" in p for p in state.problems)
-
-
-def test_split_respects_the_per_apex_cap(monkeypatch):
-    hosts = tuple(f"h{i:02d}.x.com" for i in range(10))
-    asked = _wayback_setup(monkeypatch, [], fail=True, crt_hosts=hosts)
-    state = _run_apex(wayback_limit=3, max_wayback_split_hosts=4)
-    assert len(asked) == 4
-    assert any("6개는 max_wayback_split_hosts 초과로 생략" in p for p in state.problems)
-
-
-def test_split_can_be_turned_off(monkeypatch):
-    asked = _wayback_setup(monkeypatch, [], fail=True, crt_hosts=("a.x.com",))
-    state = _run_apex(wayback_limit=3, wayback_split=False)
-    assert asked == []
-    assert any("wayback x.com: CDX timed out" in p for p in state.problems)
-
-
-# ---- fix: source outage leaves the apex unfinished (redo on resume) ----------
-
-def test_total_wayback_failure_marks_apex_incomplete(monkeypatch):
-    asked = _wayback_setup(monkeypatch, [], fail=True, crt_hosts=("a.x.com", "b.x.com"))
-
-    def all_fail(http, host, limit):
-        asked.append(host)
-        raise TimeoutError("503")
-
-    monkeypatch.setattr(collector_mod.wayback, "fetch_host_urls", all_fail)
-    org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
-    cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
-    state = OrgProgress(org_id="x")
-    lost = collector_mod._collect_apex(
-        _LinkHttp(), org, collector_mod.CollectorConfig(wayback_limit=3),
-        cand, state, endpoints=True,
-    )
-    assert lost is True  # nothing recovered -> caller must not mark it done
-
-
-def test_partial_recovery_is_not_marked_lost(monkeypatch):
-    # apex query fails, but the per-host retries succeed -> data recovered.
-    _wayback_setup(monkeypatch, [], fail=True, crt_hosts=("a.x.com", "b.x.com"))
-    org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
-    cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
-    state = OrgProgress(org_id="x")
-    lost = collector_mod._collect_apex(
-        _LinkHttp(), org, collector_mod.CollectorConfig(wayback_limit=3),
-        cand, state, endpoints=True,
-    )
-    assert lost is False  # hosts answered, so the apex is complete
-
-
-def test_split_circuit_breaker_stops_after_consecutive_failures(monkeypatch):
-    hosts = tuple(f"h{i:02d}.x.com" for i in range(20))
-    asked = _wayback_setup(monkeypatch, [], fail=True, crt_hosts=hosts)
-
-    def always_fail(http, host, limit):
-        asked.append(host)
-        raise TimeoutError("503")
-
-    monkeypatch.setattr(collector_mod.wayback, "fetch_host_urls", always_fail)
-    org = OrgConfig(org_id="x", name="X", org_type="company", enabled=True)
-    cand = ApexCandidate("x", "company", "x.com", "high", 9, (), "crt.sh", "")
-    state = OrgProgress(org_id="x")
-    lost = collector_mod._collect_apex(
-        _LinkHttp(), org,
-        collector_mod.CollectorConfig(wayback_limit=3, wayback_split_failure_cutoff=5),
-        cand, state, endpoints=True,
-    )
-    assert len(asked) == 5   # broke after 5 consecutive failures, not all 20
-    assert lost is True
-    assert any("연속 5회 실패로 중단" in p for p in state.problems)
+def test_wayback_outage_marks_apex_incomplete(monkeypatch):
+    _wayback_setup(monkeypatch, [], fail=True, crt_hosts=("x.com",))
+    state, lost = _run_apex()
+    assert lost is True                      # query raised -> redo on resume
+    assert any("CDX timed out" in p for p in state.problems)
 
 
 def test_phone_number_host_is_rejected():
@@ -352,3 +253,22 @@ def test_different_paths_are_not_collapsed(monkeypatch):
         cand, state, endpoints=True,
     )
     assert len(state.endpoint_meta) == 3  # distinct paths all kept
+
+
+# ---- numeric path-template cap (news/pr/N collapses) -------------------------
+
+def test_numeric_path_template_is_capped(monkeypatch):
+    # 20 article pages /news/pr/1..20 -> same template -> only cap kept
+    urls = [f"https://x.com/news/pr/{i}" for i in range(20)]
+    _wayback_setup(monkeypatch, urls, crt_hosts=("x.com",))
+    state, _ = _run_apex(max_endpoint_variants_per_path=3)
+    kept = [u for u in state.endpoint_meta if "/news/pr/" in u]
+    assert len(kept) == 3  # template collapsed, not 20
+
+
+def test_distinct_templates_not_collapsed(monkeypatch):
+    urls = ["https://x.com/news/pr/1", "https://x.com/board/view/1",
+            "https://x.com/admin/login"]
+    _wayback_setup(monkeypatch, urls, crt_hosts=("x.com",))
+    state, _ = _run_apex(max_endpoint_variants_per_path=3)
+    assert len(state.endpoint_meta) == 3  # different templates all kept

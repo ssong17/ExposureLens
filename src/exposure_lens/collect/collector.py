@@ -22,6 +22,7 @@ from ..core.models import (
 from ..core.net import Http, NetworkDown, RequestBudgetExceeded
 from ..core.progress import OrgProgress
 from ..sources import crtsh, cymru, urlscan, wayback
+from ..sources import search as search_src
 from .resolve import resolve_hosts
 
 _ID_SANITIZE = re.compile(r"[^A-Z0-9]+")
@@ -75,18 +76,25 @@ def select_target_apexes(
     return targets[:limit] if limit else targets  # limit 0 = unlimited
 
 
-def _variant_key(host: str, url: str) -> tuple[str, str]:
-    """Bucket a URL by (host, path), ignoring the query string.
+_NUM_SEG = re.compile(r"/\d+(?=/|$)")
 
-    ``/board.php?idx=1``, ``?idx=2``, ``?page=9`` … are the same page rendered
-    with different arguments — pagination, board ids, modes, cache-busters. They
-    almost never differ in exposed secrets/structure, so one page that Wayback
-    archived under hundreds of query strings should not become hundreds of
-    endpoints (it bloats collect and, worse, fills the Wayback 1000-row cap so
-    other subdomains get squeezed out). Keyed by path, not by a specific param,
-    so every such family collapses, not just ``idx``.
+
+def _variant_key(host: str, url: str) -> tuple[str, str]:
+    """Bucket a URL into its "template": (host, path with query + numeric ids
+    stripped).
+
+    Two families collapse to one bucket, because neither changes the exposure
+    shape — only the content:
+    - query variants: ``/board.php?idx=1``, ``?idx=2``, ``?page=9`` (ignored)
+    - numeric path ids: ``/news/pr/1``, ``/news/pr/2`` … ``/board/view/1837``
+      → ``/news/pr/N``, ``/board/view/N`` (every article is the same template)
+
+    So ``max_endpoint_variants_per_path`` keeps only a few representatives per
+    template instead of every board post, which is what balloons collect and
+    the later body reads.
     """
-    return host, urlsplit(url).path
+    path = _NUM_SEG.sub("/N", urlsplit(url).path)
+    return host, path
 
 
 def _ingest(
@@ -127,36 +135,6 @@ def _ingest(
                 prev[0], prev[1], prev[2], "urlscan", o.get("seen", "")]
 
 
-def _split_hosts(
-    state: OrgProgress, collector: CollectorConfig, cand: ApexCandidate,
-    apex_urls: list[str], *, resolve: bool,
-) -> tuple[list[str], int]:
-    """Hosts of this apex to re-query one by one, and how many the cap left out.
-
-    Hosts the apex-wide answer already covered in full are skipped. CDX sorts by
-    host, so every host in that answer is complete except the last one, which
-    the limit may have cut mid-way. Only hosts that resolve now are kept (a dead
-    host is no probe target, so its old paths are low value) unless resolution
-    is off, in which case liveness is unknown and all are kept.
-    """
-    seen = [(urlsplit(u).hostname or "").lower() for u in apex_urls]
-    covered = set(seen[:-1]) - {seen[-1]} if seen else set()
-    hosts = sorted(
-        (h for h, (apex, _conf) in state.host_apex.items()
-         if apex == cand.apex and h not in covered),
-        key=lambda h: (len(h), h),  # apex-most first when the cap bites
-    )
-    if resolve and hosts:
-        ips = resolve_hosts(
-            hosts, timeout=collector.resolve_timeout, workers=collector.resolve_workers,
-        )
-        hosts = [h for h in hosts if ips.get(h)]
-    cap = collector.max_wayback_split_hosts
-    if cap and len(hosts) > cap:
-        return hosts[:cap], len(hosts) - cap
-    return hosts, 0
-
-
 def _collect_wayback(
     http: Http,
     org: OrgConfig,
@@ -165,84 +143,30 @@ def _collect_wayback(
     state: OrgProgress,
     variant_counts: dict[tuple[str, str], int],
     *,
-    resolve: bool,
     log: Callable[[str], None],
 ) -> bool:
-    """Wayback endpoints for one apex, splitting per host when one query can't.
+    """Wayback endpoints for one apex via CDX pagination.
 
-    One ``*.apex`` query is cheap and enough for most apexes. When it comes
-    back full (``wayback_limit`` rows) it holds only the alphabetically-first
-    hosts; when it fails, typically a wildcard too big for CDX to answer in
-    time, it holds nothing. Either way the apex's live hosts are then queried
-    one by one, bounded by ``max_wayback_split_hosts``.
+    One paginated ``*.apex`` sweep returns every subdomain's URLs (no 1000-row
+    cap gap) in a handful of requests — ``wayback.fetch_urls`` walks the pages.
+    ``wayback_max_pages`` bounds a pathologically large domain.
 
-    Returns True when the apex's endpoints were LOST to source failure — the
-    apex-wide query failed and no per-host retry recovered anything (a Wayback
-    outage, as in the 503 storm that turned 494 endpoints into 5). The caller
-    leaves such an apex unfinished so ``--resume`` re-collects it, instead of
-    recording "collected, almost nothing found".
+    Returns True when the apex's endpoints were LOST to a source outage (the
+    query raised), so the caller leaves the apex unfinished for ``--resume``.
     """
-    limit = collector.wayback_limit
     try:
-        urls = wayback.fetch_urls(http, cand.apex, limit)
+        urls = wayback.fetch_urls(http, cand.apex, collector.wayback_max_pages)
         failed = ""
     except (RequestBudgetExceeded, NetworkDown):
         raise
     except Exception as exc:  # noqa: BLE001
         urls, failed = [], str(exc)
     _ingest(state, collector, cand, wayback.as_observations(urls), "wayback", variant_counts)
-
-    truncated = len(urls) >= limit
-    if not (truncated or failed) or not collector.wayback_split:
-        if failed:
-            state.problems.append(f"[{org.org_id}] wayback {cand.apex}: {failed}")
-        return bool(failed)  # apex query failed and splitting is off -> lost
-
-    why = f"{limit}건 상한 도달" if truncated else f"조회 실패({failed})"
-    hosts, skipped = _split_hosts(state, collector, cand, urls, resolve=resolve)
-    log(f"[{org.org_id}]   wayback {cand.apex}: {why} → 호스트 {len(hosts)}개 개별 조회")
-    errors = 0
-    truncated_hosts = 0
-    consecutive = 0
-    cutoff = collector.wayback_split_failure_cutoff
-    broke = False
-    tried = 0
-    for i, host in enumerate(hosts, 1):
-        tried = i
-        try:
-            got = wayback.fetch_host_urls(http, host, limit)
-        except (RequestBudgetExceeded, NetworkDown):
-            raise
-        except Exception:  # noqa: BLE001 - one host failing is not fatal
-            errors += 1
-            consecutive += 1
-            if cutoff and consecutive >= cutoff:
-                broke = True  # Wayback is down; stop burning the retry ladder
-                break
-            continue
-        consecutive = 0
-        if len(got) >= limit:
-            truncated_hosts += 1  # a single host with >limit URLs is itself cut
-        _ingest(state, collector, cand, wayback.as_observations(got), "wayback", variant_counts)
-        if i % 50 == 0:
-            log(f"[{org.org_id}]   wayback 호스트별 {i}/{len(hosts)}")
-
-    unqueried = len(hosts) - tried if broke else 0
-    note = f"[{org.org_id}] wayback {cand.apex}: {why} → 호스트 {tried}/{len(hosts)}개 조회"
-    if broke:
-        note += f", 연속 {cutoff}회 실패로 중단(Wayback 장애 추정), {unqueried}개 미조회"
-    if errors:
-        note += f", {errors}개 실패"
-    if truncated_hosts:
-        note += f", {truncated_hosts}개 호스트는 {limit}건 상한에 재도달(일부 URL 누락)"
-    if skipped:
-        note += f", {skipped}개는 max_wayback_split_hosts 초과로 생략"
-    state.problems.append(note)
-    # Lost when the apex query failed AND the split recovered nothing — every
-    # attempted host failed, or the breaker tripped before any succeeded. A
-    # cap-hit that the split filled in is expected partial cover, not a loss.
-    recovered = tried - errors
-    return bool(failed) and recovered <= 0
+    if failed:
+        state.problems.append(f"[{org.org_id}] wayback {cand.apex}: {failed}")
+        return True  # outage -> redo on resume
+    log(f"[{org.org_id}]   wayback {cand.apex}: {len(urls)} URLs (paginated)")
+    return False
 
 
 def _collect_apex(
@@ -254,14 +178,14 @@ def _collect_apex(
     variant_counts: dict[tuple[str, str], int] | None = None,
     *,
     endpoints: bool,
-    resolve: bool = True,
+    search: bool = False,
+    search_queries: tuple[str, ...] = (),
     log: Callable[[str], None] | None = None,
 ) -> bool:
-    """crt.sh hosts, then Wayback/urlscan endpoints, for one apex into ``state``.
+    """crt.sh hosts, then urlscan/search/Wayback endpoints, for one apex.
 
     A single source failing is recorded and the others still run; only the
     request cap and a dead network abort the apex (leaving it unfinished).
-    crt.sh runs first so a Wayback split knows the apex's hosts.
 
     Returns True when the apex's endpoint data was lost to a source outage (see
     ``_collect_wayback``), so the caller can leave the apex for ``--resume``.
@@ -287,12 +211,24 @@ def _collect_apex(
             raise
         except Exception as exc:  # noqa: BLE001
             state.problems.append(f"[{org.org_id}] urlscan {cand.apex}: {exc}")
-    if collector.wayback_limit > 0:
-        return _collect_wayback(
-            http, org, collector, cand, state, variant_counts,
-            resolve=resolve, log=log or (lambda _: None),
-        )
-    return False
+    # Search-engine discovery (opt-in): URLs indexed by a search engine but not
+    # in the archive/CT — admin/CMS pages Wayback misses. No-op without an API
+    # key (see sources.search).
+    if search and collector.search_limit > 0:
+        try:
+            obs = search_src.fetch_observations(
+                http, cand.apex, collector.search_limit,
+                queries=search_queries or collector.search_queries,
+            )
+            _ingest(state, collector, cand, obs, "search", variant_counts)
+        except (RequestBudgetExceeded, NetworkDown):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            state.problems.append(f"[{org.org_id}] search {cand.apex}: {exc}")
+    return _collect_wayback(
+        http, org, collector, cand, state, variant_counts,
+        log=log or (lambda _: None),
+    )
 
 
 def _finish(
@@ -315,6 +251,8 @@ def collect_org(
     *,
     resolve: bool = True,
     endpoints: bool = True,
+    search: bool = False,
+    search_queries: tuple[str, ...] = (),
     log: Callable[[str], None] | None = None,
     progress: OrgProgress | None = None,
     checkpoint: Callable[[], None] | None = None,
@@ -383,7 +321,8 @@ def collect_org(
         try:
             lost = _collect_apex(
                 http, org, collector, cand, state, variant_counts,
-                endpoints=endpoints, resolve=resolve, log=say,
+                endpoints=endpoints, search=search,
+                search_queries=search_queries, log=say,
             )
         except RequestBudgetExceeded as exc:
             problems.append(f"[{org.org_id}] stopped at request cap: {exc}")
@@ -453,7 +392,7 @@ def collect_org(
              source="crt.sh+wayback", freshness=fresh)
     # Endpoints: urlscan saw it recently = current; wayback-only = archived.
     for url, (apex, conf, host, ep_src, seen) in endpoint_meta.items():
-        fresh = "current" if ep_src == "urlscan" else "archived"
+        fresh = "current" if ep_src in ("urlscan", "search") else "archived"
         _add("endpoint", apex, conf, host, url,
              source=ep_src, freshness=fresh, last_seen=seen)
 

@@ -216,12 +216,15 @@ def findings_summary_lines(
         group = [f for f in exposures if _attr(f, "severity") == severity]
         if not group:
             continue
+        # critical/high are what the reader must act on, so never truncate them
+        # — a leaked credential must not vanish past a bullet cap. medium/low are
+        # candidates/noise and stay capped to keep the file readable.
+        cap = len(group) if severity in ("critical", "high") else MAX_BULLETS_PER_SEVERITY
         lines.append(f"## {severity} ({len(group)})")
         lines.append("")
-        lines.extend(_bullet(f) for f in group[:MAX_BULLETS_PER_SEVERITY])
-        if len(group) > MAX_BULLETS_PER_SEVERITY:
-            hidden = len(group) - MAX_BULLETS_PER_SEVERITY
-            lines.append(f"- ... 외 {hidden}건 (전체는 JSONL 참고)")
+        lines.extend(_bullet(f) for f in group[:cap])
+        if len(group) > cap:
+            lines.append(f"- ... 외 {len(group) - cap}건 (전체는 JSONL 참고)")
         lines.append("")
 
     if not exposures:
@@ -290,7 +293,13 @@ def collect_stats_lines(assets: list[dict], orgs=None) -> list[str]:
 
 
 def print_findings(findings: list, printer, *, limit: int = 30) -> None:
-    """Console preview: exposures first, ranked, reachability excluded."""
+    """Console preview: exposures first, ranked, reachability excluded.
+
+    The ranked list is severity-first, so when open ports (critical/high)
+    dominate they fill the whole preview and the other kinds (sensitive hosts,
+    admin pages, …) vanish past ``limit``. So a per-category rollup is always
+    printed too — the console then shows every KIND detected, not just ports.
+    """
     exposures, liveness = split_liveness(findings)
     exposures = sorted(exposures, key=lambda f: severity_rank(_attr(f, "severity")))
     for f in exposures[:limit]:
@@ -302,7 +311,29 @@ def print_findings(findings: list, printer, *, limit: int = 30) -> None:
             f"{_attr(f, 'url') or _attr(f, 'evidence')}"
         )
     if len(exposures) > limit:
-        printer(f"  ... 외 {len(exposures) - limit}건")
+        printer(f"  ... 외 {len(exposures) - limit}건 (유형별 집계는 아래)")
+    for line in _category_rollup_compact(exposures):
+        printer(line)
     rollup = liveness_rollup(liveness)
     if rollup:
         printer(f"  ({rollup})")
+
+
+def _category_rollup_compact(exposures: list) -> list[str]:
+    """One console line per detected kind, worst-severity-first: '유형 n (sev)'."""
+    if not exposures:
+        return []
+    per: dict[str, Counter] = {}
+    for f in exposures:
+        per.setdefault(_attr(f, "category"), Counter())[_attr(f, "severity")] += 1
+    order = sorted(
+        per.items(),
+        key=lambda kv: (min(severity_rank(s) for s in kv[1]), -sum(kv[1].values())),
+    )
+    lines = ["  ── 감지 유형별 집계 ──"]
+    for category, counts in order:
+        worst = min(counts, key=severity_rank)
+        lines.append(
+            f"    {category_label(category):<22} {sum(counts.values()):>4}건  (최고 {worst})"
+        )
+    return lines

@@ -184,8 +184,8 @@ def check_exposure(
         if not data:
             continue
         # Only report OPEN PORTS — a fact Shodan actually observed. InternetDB's
-        # `vulns` are inferred from version banners ("this version is associated
-        # with CVE-X"), not confirmed exploitable, so we do not claim them.
+        # `vulns` are inferred from version banners, not confirmed exploitable,
+        # so we do not report them.
         ports = data.get("ports", []) or []
         say(f"  ({i}/{len(ips)}) {ip}: {len(ports)} ports open")
         for port in ports:

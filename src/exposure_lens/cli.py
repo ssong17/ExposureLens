@@ -121,6 +121,15 @@ def _add_resume(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_vibe(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--vibe", action="store_true",
+        help="also fingerprint AI site builders (Lovable, v0, Replit, Base44, "
+        "Manus, Claude) from host names and served bodies — low-severity "
+        "'vibe-platform' findings",
+    )
+
+
 def _add_probe_options(parser: argparse.ArgumentParser, *, full: bool) -> None:
     """Options for the active stage, shared by `probe` and `run --probe`.
 
@@ -176,6 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--no-resolve", action="store_true", help="skip IP/ASN resolution")
     run.add_argument("--no-endpoints", action="store_true", help="skip Wayback endpoints")
+    run.add_argument("--no-search", dest="search", action="store_false", help="turn OFF search-engine discovery (on by default; no-op anyway without a GOOGLE_API_KEY+GOOGLE_CSE_ID or BRAVE_SEARCH_API_KEY env var)")
+    run.add_argument("--search-query", action="append", metavar="KW", help="search keyword/template to use with --search (repeatable). A bare keyword becomes site:apex \"KW\"; a value with {apex} is a full template. Overrides config search_queries")
     run.add_argument(
         "--no-archive-bodies", action="store_true",
         help="skip the passive archived-body pass (Wayback). By default `run` "
@@ -192,6 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="lowest severity to report (default: medium)",
     )
     _add_resume(run)
+    _add_vibe(run)
     _add_common(run)
 
     apex = sub.add_parser(
@@ -211,6 +223,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument(
         "--no-endpoints", action="store_true", help="skip Wayback endpoints"
+    )
+    collect.add_argument(
+        "--no-search", dest="search", action="store_false", help="turn OFF search-engine discovery (on by default; no-op anyway without a GOOGLE_API_KEY+GOOGLE_CSE_ID or BRAVE_SEARCH_API_KEY env var)"
+    )
+    collect.add_argument(
+        "--search-query", action="append", metavar="KW", help="search keyword/template to use with --search (repeatable). A bare keyword becomes site:apex \"KW\"; a value with {apex} is a full template. Overrides config search_queries"
     )
     collect.add_argument(
         "--fresh", action="store_true",
@@ -242,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the Shodan current-services check (pure offline rules)",
     )
     _add_resume(scan)
+    _add_vibe(scan)
     _add_common(scan)
 
     # probe = the active stage: live GET to the target.
@@ -265,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="lowest severity to report (default: low)",
     )
     _add_probe_options(probe, full=True)
+    _add_vibe(probe)
     _add_common(probe)
     return parser
 
@@ -446,6 +466,8 @@ def _collect_stage(
                 http, org, app.collector,
                 resolve=not args.no_resolve,
                 endpoints=not args.no_endpoints,
+                search=getattr(args, "search", True),
+                search_queries=tuple(getattr(args, "search_query", None) or ()),
                 log=log,
                 progress=state,
                 checkpoint=progress.save,
@@ -519,7 +541,8 @@ def _scan_stage(
     an interrupted run already got, so a resume only queries the rest. A
     ``NetworkDown`` propagates to the caller.
     """
-    findings = scan_assets(assets, min_severity=args.min_severity)
+    findings = scan_assets(assets, min_severity=args.min_severity,
+                           vibe=getattr(args, "vibe", False))
     problems: list[str] = []
     if not args.no_services and http is not None:
         print(
@@ -603,6 +626,7 @@ def _probe_stage(
         confidence=args.confidence,
         scripts_only=getattr(args, "scripts", False),
         only_findings=getattr(args, "only_findings", False),
+        vibe=getattr(args, "vibe", False),
         log=_logger(args.quiet),
     )
 
@@ -660,6 +684,7 @@ def _passive_body_stage(
     arch = run_inspection(
         http, assets, [], source=WAYBACK,
         min_severity=args.min_severity, confidence=args.confidence,
+        vibe=getattr(args, "vibe", False),
         log=_logger(args.quiet),
     )
     findings.extend(arch.findings)  # archive-body findings are passive candidates
@@ -690,6 +715,7 @@ def _active_probe_stage(
         http, assets, [f.to_dict() for f in passive_findings],
         source=FETCH, min_severity=args.min_severity, confidence=args.confidence,
         restrict_body_urls=archive_missed,
+        vibe=getattr(args, "vibe", False),
         log=_logger(args.quiet),
     )
     _write_probe_output(out_dir, args, result, app.orgs)
@@ -745,6 +771,15 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
             )
             return _report(out_dir, http, problems, code=EXIT_NETWORK_DOWN)
         print(f"collect - {len(asset_dicts)} assets")
+        # Write the collect summary now, before the long scan/archive/probe
+        # stages. If one of those is later killed, this summary still exists
+        # (previously only the final run_summary was written, so an interrupted
+        # run left no summary at all).
+        write_summary(
+            _f(out_dir, args, "collect_summary.md"), f"collect - {run_date()}",
+            problems, preamble=collect_stats_lines(asset_dicts, app.orgs),
+            command=args._command_str,
+        )
         scan_progress = _start_scan_progress(args, out_dir, str(collect_path))
 
     http.clear_cache()  # index pages are done with; do not carry them further

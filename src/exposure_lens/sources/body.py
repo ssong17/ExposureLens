@@ -14,12 +14,13 @@ content rules can read it.
 """
 from __future__ import annotations
 
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from ..core.net import Http
 
 # A timestamp far in the future redirects to the most recent snapshot.
 _SNAPSHOT = "https://web.archive.org/web/2999id_/{url}"
+
 
 # Bodies that cannot hold text secrets are not worth a rule pass.
 _SKIP_CT = ("image/", "video/", "audio/", "font/", "application/pdf")
@@ -48,3 +49,19 @@ def fetch_body(http: Http, url: str) -> tuple[int, str]:
     if not _is_textual(content_type):
         return status, ""
     return status, text
+
+
+def home_body(http: Http, url: str) -> tuple[int, int]:
+    """GET the host ROOT ("/") — a real, non-guessed path — as a baseline.
+
+    Returns ``(status, body_length)``. An SPA / catch-all router serves this
+    same index page for every route, so when a discovered path returns a body
+    of the same size it is the index fallback, not that path's own content.
+    Using "/" (not a fabricated path) keeps the "never guess paths" guarantee.
+    """
+    parts = urlsplit(url)
+    root = urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
+    status, text, content_type, _loc = http.probe(root)
+    if not _is_textual(content_type):
+        return status, 0
+    return status, len(text)

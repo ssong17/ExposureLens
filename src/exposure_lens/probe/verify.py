@@ -104,6 +104,7 @@ def verify_findings(
     confidence: str = "high",
     next_id: "Callable[[], str] | None" = None,
     dedup: "dict[tuple[str, str, str], int] | None" = None,
+    vibe: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> tuple[list[Finding], list[str]]:
     """Return (verify findings incl. liveness rows, problems).
@@ -197,6 +198,7 @@ def verify_findings(
                     next_id=next_id,
                     freshness="current",
                     dedup=dedup,
+                    vibe=vibe,
                 ))
 
     out.sort(key=lambda f: SEVERITY_ORDER[f.severity])
