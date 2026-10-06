@@ -15,8 +15,8 @@ stages cannot drift apart. The engine lives in ``scan`` because the scan stage
 owns it and ``probe`` only reuses the fetch side (``scan`` never imports
 ``probe``, keeping the scan→probe dependency one-way).
 
-It never guesses new paths and never sends a payload. Credential matches are
-masked by ``scan_body``.
+It never guesses new paths and never sends a payload. Matched values are stored
+verbatim (unmasked) by ``scan_body``.
 """
 from __future__ import annotations
 

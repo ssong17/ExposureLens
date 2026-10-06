@@ -14,7 +14,7 @@ Boundaries this keeps (matching the tool's scan-first stance):
 - Authorization gaps are reported as "answered 2xx unauthenticated", nothing more.
 - Liveness is always recorded, but as its own category: it is an asset property,
   not an exposure, and reports roll it up instead of listing it.
-- Secrets found in a body are masked.
+- Secrets found in a body are stored verbatim (unmasked) for operator triage.
 """
 from __future__ import annotations
 

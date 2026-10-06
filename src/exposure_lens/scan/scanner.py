@@ -2,8 +2,9 @@
 
 Applies the rule sets to hostnames and endpoint URLs already gathered by the
 collector, and (via ``scan_body``) to response bodies another stage retrieved.
-It never requests the target itself, never verifies a secret, and masks any
-matched secret value. Findings are ranked by severity.
+It never requests the target itself and never verifies a secret. Matched values
+are stored verbatim (unmasked) for operator triage. Findings are ranked by
+severity.
 """
 from __future__ import annotations
 
@@ -37,16 +38,12 @@ from .rules import (
 from .vibe_rules import detect_body as vibe_detect_body
 from .vibe_rules import detect_host as vibe_detect_host
 
-# Only credential-bearing categories are masked; a route/URL/authz-check IS the
-# finding, so it is kept verbatim (just length-capped).
-_MASK_CATEGORIES = {"leaked-secret", "hardcoded-secret", "db-exposure", "pii-exposure"}
 # Host findings come from the NAME alone, which cannot tell git-the-tool from
 # "GIT" the acronym, or an open service from a login-gated VPN portal. So a name
 # match is a CANDIDATE, capped here; only `probe` (an actual unauthenticated
 # 2xx) promotes it back to high/critical. Keeps ranking honest.
 _CANDIDATE_CAP = "medium"
 
-_ASSIGN = re.compile(r"^(.*?[:=]\s*[\"']?)(.+?)([\"']?)$", re.DOTALL)
 # The value side of an assignment/header match, for the placeholder/entropy test.
 _VALUE = re.compile(
     r"(?:[:=]\s*|\bbearer\s+|\bbasic\s+)[\"']?([^\"'\s]+)[\"']?\s*$",
@@ -114,26 +111,11 @@ def is_credible_secret(rule_id: str, raw: str) -> bool:
     return _shannon_entropy(value) >= MIN_SECRET_ENTROPY
 
 
-def _mask(value: str) -> str:
-    value = value.strip()
-    if "=" in value:  # keep the key, hide the value
-        key, _, secret = value.partition("=")
-        return f"{key}={_mask(secret)}"
-    if len(value) <= 8:
-        return value[:2] + "****"
-    return value[:4] + "****" + value[-2:]
-
-
-def _mask_match(value: str) -> str:
-    """Mask a body match, keeping any leading key/delimiter for triage."""
-    value = value.strip()
-    assign = _ASSIGN.match(value)
-    if assign:  # e.g.  password: "hunter2"  ->  password: "hu****"
-        prefix, secret, suffix = assign.groups()
-        return f"{prefix}{_mask(secret)}{suffix}"
-    if len(value) <= 8:
-        return value[:2] + "****"
-    return value[:4] + "****" + value[-2:]
+def _evidence(raw: str) -> str:
+    """The matched text stored verbatim as evidence, whitespace-collapsed and
+    length-capped. Secret values are NOT masked — the operator's local recon
+    output keeps the real value for triage/verification."""
+    return " ".join(raw.split())[:160]
 
 
 def scan_assets(
@@ -196,7 +178,7 @@ def scan_assets(
             for rule in SECRET_RULES:
                 found = rule.pattern.search(url)
                 if found and is_credible_secret(rule.id, found.group(0)):
-                    ev = _mask(found.group(0))
+                    ev = _evidence(found.group(0))
                     matches.append(
                         (rule.id, rule.category, rule.severity, ev, url, path)
                     )
@@ -256,7 +238,7 @@ def scan_body(
     """Apply CONTENT_RULES/CLIENT_RULES to one response body already fetched.
 
     ``text`` is the served content (a JS bundle, config file, JSON response, or
-    archived page). Every credential match is masked before it is stored, and
+    archived page). Every match is stored verbatim (unmasked, length-capped), and
     nothing here contacts the target — the caller supplies the body.
     ``next_id`` is the run-wide id allocator (see ``FindingIds``) so ids stay
     unique no matter how many stages emit findings into one run.
@@ -286,10 +268,7 @@ def scan_body(
             raw = found.group(0)
             if not is_credible_secret(rule.id, raw):
                 continue
-            if rule.category in _MASK_CATEGORIES:
-                evidence = _mask_match(raw)
-            else:
-                evidence = " ".join(raw.split())[:160]  # verbatim, length-capped
+            evidence = _evidence(raw)  # verbatim (unmasked), length-capped
             key = (rule.id, evidence)
             if key in seen:
                 continue

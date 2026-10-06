@@ -233,7 +233,7 @@ exposure-lens scan --all-enabled
 
 - confidence(apex 소유 확신도): `high`(seed 일치 또는 인증서 지배) / `medium`(TLD 클래스 일치) / `low`
 - freshness: `current`(현재) / `archived`(과거)
-- 시크릿 값은 마스킹되어 저장된다(`AIza****fe`). 라우트·주소·설정 값은 그대로 저장된다
+- 시크릿 값·라우트·주소·설정 값 모두 **마스킹 없이 원문 그대로** 저장된다(운영자 분류·검증용 로컬 출력). `output/`은 gitignore 대상이다
 
 ### JSONL 레코드
 
@@ -252,7 +252,7 @@ finding(scan/probe):
 {"finding_id":"P_20260914_000001","org_id":"snu","org_name":"Seoul National University",
  "asset_ref":"SNU_20260914_000512","severity":"critical","category":"db-exposure",
  "rule":"body-db-uri","host":"legacy.snu.ac.kr","url":"https://legacy.snu.ac.kr/config.js",
- "path":"/config.js","evidence":"postgres://ad****db","status":"200",
+ "path":"/config.js","evidence":"postgres://admin:s3cr3tpw@db.internal:5432/prod","status":"200",
  "source":"fetch-body","freshness":"current"}
 ```
 

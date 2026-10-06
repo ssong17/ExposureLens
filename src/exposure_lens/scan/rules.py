@@ -205,8 +205,8 @@ SECRET_RULES = _rules(
 # archived pages). This is what the body passes (`scan` archive + `probe` live)
 # run after reading a body — the URL
 # rules above only see the address, these see what the address serves. Patterns
-# stay high-signal because bodies are large and noisy; every match is masked
-# before it is recorded, and secrets are never verified.
+# stay high-signal because bodies are large and noisy; every match is recorded
+# verbatim (unmasked, length-capped), and secrets are never verified.
 CONTENT_RULES = _rules(
     [
         # Hard-coded cloud/service credentials.

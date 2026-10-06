@@ -1,8 +1,8 @@
-"""Scan rules: host/path/secret detection, severity, masking, dedup."""
+"""Scan rules: host/path/secret detection, severity, verbatim evidence, dedup."""
 from __future__ import annotations
 
 from exposure_lens.core.models import FindingIds
-from exposure_lens.scan.scanner import _mask, _mask_match, scan_assets, scan_body
+from exposure_lens.scan.scanner import scan_assets, scan_body
 
 from _helpers import run_scan_body
 
@@ -59,24 +59,19 @@ def test_path_rules_flag_sensitive_files():
     assert "P3" not in cats
 
 
-def test_secret_in_query_is_masked():
+def test_secret_in_query_stored_verbatim():
     url = "https://a.x.com/cb?api_key=SUPERSECRET123456"
     findings = scan_assets([_asset(host="a.x.com", url=url)], min_severity="low")
     secret = next(f for f in findings if f.category == "leaked-secret")
     assert secret.severity == "high"
-    assert "SUPERSECRET123456" not in secret.evidence
-    assert secret.evidence.startswith("api_key=")
+    # unmasked: the real value is kept for operator triage
+    assert "api_key=SUPERSECRET123456" in secret.evidence
 
 
 def test_min_severity_filters_low():
     assets = [_asset(host="a.x.com", url="https://a.x.com/swagger/")]  # low
     assert scan_assets(assets, min_severity="low")
     assert not scan_assets(assets, min_severity="high")
-
-
-def test_mask():
-    assert _mask("SUPERSECRET123456") == "SUPE****56"
-    assert _mask("short") == "sh****"
 
 
 def _body(text: str):
@@ -95,30 +90,24 @@ def test_client_rules_detect_authz_and_routes():
     assert {"client-authz", "api-endpoint", "sourcemap"} <= cats
 
 
-def test_client_findings_are_not_masked():
-    # A route/authz check keeps its literal value (masking would hide the point).
+def test_route_findings_keep_literal_value():
+    # A route/authz check keeps its literal value (it IS the finding).
     fs = _body('fetch("/admin/users/delete")')
     api = next(f for f in fs if f.category == "api-endpoint")
     assert "/admin/users/delete" in api.evidence
-    assert "****" not in api.evidence
 
 
-def test_secrets_in_body_still_masked():
+def test_secrets_in_body_stored_verbatim():
     fs = _body('const t="ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";')
     sec = next(f for f in fs if f.category == "leaked-secret")
-    assert "****" in sec.evidence
-    assert "ABCDEFGHIJKLMNOP" not in sec.evidence
+    # unmasked: the full token is kept
+    assert "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" in sec.evidence
+    assert "****" not in sec.evidence
 
 
-# ---- scan_body: masking and severity floor (moved from the body-read tests) --
+# ---- scan_body: verbatim evidence and severity floor -------------------------
 
-def test_mask_match_keeps_key_hides_value():
-    masked = _mask_match('password: "hunter2secret"')
-    assert "hunter2secret" not in masked
-    assert masked.startswith("password:")
-
-
-def test_scan_body_detects_and_masks_multiple_categories():
+def test_scan_body_detects_multiple_categories_verbatim():
     body = (
         'apiKey: "AKIAABCDEFGHIJKLMNOP"\n'
         'DATABASE_URL = "postgres://admin:s3cr3tpw@db.internal:5432/prod"\n'
@@ -127,8 +116,12 @@ def test_scan_body_detects_and_masks_multiple_categories():
     fs = _body(body)
     cats = {f.category for f in fs}
     assert {"leaked-secret", "db-exposure", "pii-exposure"} <= cats
-    assert all("s3cr3tpw" not in f.evidence for f in fs)
-    assert all("1234567" not in f.evidence for f in fs)
+    # unmasked: the DB password is kept verbatim in the db-exposure evidence
+    db = next(f for f in fs if f.category == "db-exposure")
+    assert "s3cr3tpw" in db.evidence
+    # unmasked: the RRN is kept verbatim in the pii-exposure evidence
+    pii = next(f for f in fs if f.category == "pii-exposure")
+    assert "900101-1234567" in pii.evidence
 
 
 def test_scan_body_respects_min_severity():
