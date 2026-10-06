@@ -63,7 +63,7 @@ DEFAULT_CACHE_ENTRIES = 128
 class _NoRedirect(HTTPRedirectHandler):
     """Surface 3xx as an HTTPError instead of following it.
 
-    `inspect` needs the raw status of a URL to tell an open page (2xx) from one
+    `probe` needs the raw status of a URL to tell an open page (2xx) from one
     that challenges or redirects to a login (301/302/401/403); following the hop
     would hide exactly that signal.
     """

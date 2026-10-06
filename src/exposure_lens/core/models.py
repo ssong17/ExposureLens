@@ -1,7 +1,7 @@
 """Shared data records and orderings for the pipeline.
 
 The severity/confidence orderings live here because every stage ranks by them;
-keeping one copy is what stops `scan`, `inspect` and `verify` from drifting apart.
+keeping one copy is what stops `scan`, `probe` and `verify` from drifting apart.
 """
 from __future__ import annotations
 
@@ -125,8 +125,8 @@ class FindingIds:
     """Run-wide unique finding-id allocator.
 
     Each stage used to number its own findings from 1 with its own prefix, so a
-    probe run that did both body inspection and verification emitted
-    ``V_<date>_000001`` twice (inspection's liveness row and verification's) and
+    probe run that did both body reads and verification emitted
+    ``V_<date>_000001`` twice (the body read's liveness row and verification's) and
     ``I_<date>_...`` twice again. One allocator shared by every stage in a run
     removes the whole class of collision.
     """

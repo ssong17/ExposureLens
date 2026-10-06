@@ -8,8 +8,10 @@ is deleted when it finishes, so its presence alone means "this run broke off".
   flight down to the apex (its discovered candidates and what the finished
   apexes produced). Rewritten atomically after every apex.
 - scan: ``<HHMMSS>_scan.progress.jsonl`` — a header naming the assets file,
-  then one line per Shodan IP answered. Append-only, so an interrupted write
-  loses at most the last line.
+  then one line per Shodan IP answered AND one line per archived-body URL read
+  (its findings + whether the archive had a snapshot). Append-only, so an
+  interrupted write loses at most the last line, and both slow network paths
+  (Shodan current-services and the Wayback archive-body pass) resume.
 """
 from __future__ import annotations
 
@@ -118,12 +120,21 @@ class CollectProgress:
 
 
 class ScanProgress:
-    """Append-only log of Shodan answers: ip -> record (None = no data)."""
+    """Append-only log of the scan stage's two slow network paths.
+
+    ``answers`` holds Shodan records (ip -> record, None = no data); ``arch``
+    holds the archived-body pass's per-URL result (url -> finding dicts) plus a
+    separate ``arch_missed`` set of URLs the archive had no snapshot for. A
+    resume reuses both, so neither the Shodan queries nor the Wayback reads are
+    repeated.
+    """
 
     def __init__(self, path: Path, assets_path: str = "") -> None:
         self.path = path
         self.assets_path = assets_path
         self.answers: dict[str, dict | None] = {}
+        self.arch: dict[str, list[dict]] = {}
+        self.arch_missed: set[str] = set()
 
     @classmethod
     def start(cls, path: Path, assets_path: str) -> "ScanProgress":
@@ -147,12 +158,28 @@ class ScanProgress:
                     progress.assets_path = row["assets"]
                 elif "ip" in row:
                     progress.answers[row["ip"]] = row.get("data")
+                elif "arch" in row:
+                    url = row["arch"]
+                    progress.arch[url] = row.get("findings", [])
+                    if row.get("missed"):
+                        progress.arch_missed.add(url)
         return progress
 
     def record(self, ip: str, data: dict | None) -> None:
         self.answers[ip] = data
         with self.path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps({"ip": ip, "data": data}, ensure_ascii=False) + "\n")
+
+    def record_archive(self, url: str, findings: list[dict], missed: bool) -> None:
+        """Persist one archived-body URL's result (replayed on resume)."""
+        self.arch[url] = findings
+        if missed:
+            self.arch_missed.add(url)
+        with self.path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(
+                {"arch": url, "findings": findings, "missed": missed},
+                ensure_ascii=False,
+            ) + "\n")
 
     def finish(self) -> None:
         self.path.unlink(missing_ok=True)

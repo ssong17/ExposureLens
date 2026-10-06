@@ -1,4 +1,4 @@
-"""Shodan InternetDB adapter — free, keyless, passive view of CURRENT exposure.
+"""Shodan InternetDB adapter — free, keyless, no-touch view of CURRENT exposure.
 
 ``https://internetdb.shodan.io/<ip>`` returns what Shodan's own scanners last saw
 on an IP: open ports, hostnames, services. Reading it never touches

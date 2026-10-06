@@ -1,4 +1,4 @@
-"""Passive exposure scanner: collected assets -> findings.
+"""Scan-stage exposure rules: collected assets -> findings (never touches the target).
 
 Applies the rule sets to hostnames and endpoint URLs already gathered by the
 collector, and (via ``scan_body``) to response bodies another stage retrieved.

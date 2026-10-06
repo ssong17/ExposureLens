@@ -150,25 +150,28 @@ def test_fresh_discards_the_previous_run(tmp_path, no_network, monkeypatch, caps
 
 
 def test_run_probe_uses_the_same_stage_as_probe(tmp_path, no_network, monkeypatch):
-    """Regression: `run --probe` used to skip body inspection entirely."""
+    """Regression: `run --probe` used to skip body reads entirely."""
     seen: dict = {}
 
-    def fake_run_inspection(http, assets, prior=None, **kw):
+    def fake_run_probe(http, assets, prior=None, **kw):
         seen.update(kw)
         seen["assets"] = len(assets)
-        from exposure_lens.probe.inspect import InspectionResult
-        return InspectionResult()
+        from exposure_lens.probe.prober import ProbeResult
+        return ProbeResult()
 
-    monkeypatch.setattr(cli, "run_inspection", fake_run_inspection)
+    monkeypatch.setattr(cli, "run_probe", fake_run_probe)
     code = cli.main([
         "run", "-i", _config(tmp_path), "--all-enabled",
         "-o", str(tmp_path / "out"), "-q", "--probe", "--no-services",
+        "--no-archive-bodies",
     ])
     assert code == 0
     # The pipeline hands the full asset list to the same entry point the
-    # `probe` command uses, with the live source.
+    # `probe` command uses. The probe pass is always a live fetch now (no
+    # source knob), and with the archive pass off it reads every body
+    # (restrict_body_urls=None) rather than only the archive's misses.
     assert seen["assets"] == 2
-    assert seen["source"] == "fetch"
+    assert seen["restrict_body_urls"] is None
 
 
 def test_scan_writes_summary_without_liveness_bullets(

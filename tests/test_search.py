@@ -32,11 +32,34 @@ def test_google_cse_results_are_shaped(monkeypatch):
     monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
     http = _Http({"items": [{"link": "https://x.com/admin"},
                             {"link": "https://x.com/login"}]})
-    obs = search.fetch_observations(http, "x.com", limit=10, provider="google")
+    # kr_only=False to exercise shaping on a non-.kr apex without the KR filter.
+    obs = search.fetch_observations(http, "x.com", limit=10, provider="google",
+                                    kr_only=False)
     urls = {o["url"] for o in obs}
     assert urls == {"https://x.com/admin", "https://x.com/login"}
     assert all(o["seen"] == "" and o["status"] == "" for o in obs)
     assert any("customsearch" in u for u in http.urls)
+
+
+def test_kr_filter_keeps_kr_tld_and_hangul_drops_the_rest(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "k")
+    monkeypatch.setenv("GOOGLE_CSE_ID", "cse")
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    http = _Http({"items": [
+        {"link": "https://a.co.kr/admin", "title": "관리자", "snippet": ""},  # .kr
+        {"link": "https://x.com/login", "title": "로그인 페이지"},            # Hangul
+        {"link": "https://x.com/en/admin", "title": "Admin", "snippet": "sign in"},  # neither
+    ]})
+    urls = {o["url"] for o in search.fetch_observations(http, "x.com", provider="google")}
+    assert urls == {"https://a.co.kr/admin", "https://x.com/login"}  # non-KR dropped
+
+
+def test_kr_filter_is_default_on(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "k")
+    monkeypatch.setenv("GOOGLE_CSE_ID", "cse")
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    http = _Http({"items": [{"link": "https://x.com/admin", "title": "Admin"}]})
+    assert search.fetch_observations(http, "x.com", provider="google") == []
 
 
 def test_bare_keyword_becomes_site_query():

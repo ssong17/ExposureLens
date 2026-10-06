@@ -1,9 +1,10 @@
 """Current-exposure check: collected IPs -> Shodan InternetDB -> findings.
 
-Where `inspect --source wayback` reads the past, this reads what a third-party
+Where the `scan` archived-body pass reads the past, this reads what a third-party
 scanner (Shodan) sees on our IPs right now: internet-facing databases, caches and
-admin services. Passive — Shodan already did the scanning; we only read its
-result — but present-tense, which is what an attacker actually acts on.
+admin services. It never contacts the target — Shodan already did the scanning;
+we only read its result — but present-tense, which is what an attacker actually
+acts on.
 
 Attribution is the hard part here. An open 3306 on an IP is only *this* org's
 exposure if the IP is *this* org's. On shared hosting or a CDN edge, dozens of
@@ -15,7 +16,7 @@ that actually owns the address is recorded as evidence either way.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from ..core.models import (
@@ -207,3 +208,4 @@ def check_exposure(
     findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
     say(f"done: {len(findings)} findings from {len(ips)} IPs")
     return findings, problems
+

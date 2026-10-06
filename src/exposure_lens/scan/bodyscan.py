@@ -1,27 +1,22 @@
-"""Content inspection — the tool's single active stage ("probe").
+"""Response-body reading engine, shared by the two body passes.
 
-This is the "read what the address serves" pass that the passive `scan` cannot
-do on the URL alone. It never guesses new paths and never sends a payload: it
-takes assets and findings already collected, retrieves each body (archived
-snapshot by default, or one direct GET when explicitly allowed), and runs the
-content rules over the result.
+Reading what an address *serves* (not just its URL/host name) is the job of two
+stages:
 
-``run_inspection`` is the one entry point. It folds both halves of the active
-work together:
+  - ``scan``: reads ARCHIVED snapshots from the Wayback Machine. The target is
+    never contacted. ``scan_archive_bodies`` is this stage's entry point, and it
+    is resumable (see ``done``/``on_result``).
+  - ``probe``: reads the LIVE body with one GET to the target. The ``probe``
+    package drives this via ``read_bodies(..., source=FETCH)``.
 
-  1. endpoint bodies -> secrets / config / DB / PII / client-code surface,
-     following a source map when one is referenced;
-  2. verification of existing scan findings -> reachability and known-exposure
-     paths answering unauthenticated.
+The low-level loop (``read_bodies``) is the same for both — select endpoints,
+retrieve each body, run the content rules, follow a source map — so the two
+stages cannot drift apart. The engine lives in ``scan`` because the scan stage
+owns it and ``probe`` only reuses the fetch side (``scan`` never imports
+``probe``, keeping the scan→probe dependency one-way).
 
-Both the ``probe`` command and ``run --probe`` call it, so the two can no longer
-disagree about what "active" means — previously ``run --probe`` ran only step 2
-and silently skipped every body, JS and secret check.
-
-Safety gates, all enforced here rather than at the call sites:
-- direct fetches only for high-confidence apexes, so we never touch a host that
-  might belong to another organization;
-- one GET per URL, redirects not followed, no payloads, no path guessing.
+It never guesses new paths and never sends a payload. Credential matches are
+masked by ``scan_body``.
 """
 from __future__ import annotations
 
@@ -29,7 +24,7 @@ import base64
 import binascii
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import replace
 from typing import Callable
 from urllib.parse import urljoin, urlsplit
 
@@ -38,14 +33,12 @@ from ..core.models import (
     Finding,
     FindingIds,
     confidence_rank,
-    is_liveness,
     timestamp_now,
 )
 from ..core.net import Http, RequestBudgetExceeded
 from ..sources import body as body_src
-from ..scan.rules import AUTHZ_PATH, base_severity
-from ..scan.scanner import scan_body
-from .verify import make_liveness_finding, verify_findings
+from .rules import AUTHZ_PATH
+from .scanner import scan_body
 
 WAYBACK = "wayback"
 FETCH = "fetch"
@@ -55,6 +48,31 @@ _SOURCEMAP_REF = re.compile(r"//[#@]\s*sourceMappingURL=(\S+)")
 # Client-code endpoints worth reading for the JS/authz/surface rules — the
 # script bundles and source maps where routes and auth checks actually live.
 _SCRIPT_EXT = {"js", "mjs", "cjs", "ts", "json", "map"}
+
+# Static assets: a 2xx on one of these is the server returning a file, never a
+# gate falling open. ``authz-open`` is about a protected PAGE answering, so a
+# .js/.css/.map named ".../internal/foo.js" must not count as broken access.
+_STATIC_ASSET_EXT = {
+    "js", "mjs", "cjs", "css", "map", "json", "ico", "svg", "png", "jpg",
+    "jpeg", "gif", "webp", "woff", "woff2", "ttf", "eot", "otf",
+}
+
+# A 200 page that shows a login form means authentication IS enforced — the
+# gate is working, so it must NOT be reported as "open without auth".
+_LOGIN_MARKERS = re.compile(
+    r"""(?ix)
+    type\s*=\s*["']password["']      # a password input
+    | name\s*=\s*["']password["']
+    | \b(로그인|로그인하기|login|log\s*in|sign\s*in|signin)\b
+    | \bauthenticat
+    """,
+)
+
+# Keep at most this many query-string variants of one (host, path). The 455
+# `?page=1..N` copies of one template all serve the same body, so probing every
+# one cost ~4h and (before dedup) reported the same secret hundreds of times. A
+# few variants still cover the case where the query genuinely changes the body.
+_MAX_VARIANTS_PER_PATH = 3
 
 
 def _sourcemap_sources(map_text: str) -> list[str]:
@@ -104,31 +122,10 @@ def _is_script_like(url: str) -> bool:
     return ext in _SCRIPT_EXT
 
 
-# Static assets: a 2xx on one of these is the server returning a file, never a
-# gate falling open. ``authz-open`` is about a protected PAGE answering, so a
-# .js/.css/.map named ".../internal/foo.js" must not count as broken access.
-_STATIC_ASSET_EXT = {
-    "js", "mjs", "cjs", "css", "map", "json", "ico", "svg", "png", "jpg",
-    "jpeg", "gif", "webp", "woff", "woff2", "ttf", "eot", "otf",
-}
-
-
 def _is_static_asset(url: str) -> bool:
     tail = urlsplit(url).path.rsplit("/", 1)[-1]
     ext = tail.rsplit(".", 1)[-1].lower() if "." in tail else ""
     return ext in _STATIC_ASSET_EXT
-
-
-# A 200 page that shows a login form means authentication IS enforced — the
-# gate is working, so it must NOT be reported as "open without auth".
-_LOGIN_MARKERS = re.compile(
-    r"""(?ix)
-    type\s*=\s*["']password["']      # a password input
-    | name\s*=\s*["']password["']
-    | \b(로그인|로그인하기|login|log\s*in|sign\s*in|signin)\b
-    | \bauthenticat
-    """,
-)
 
 
 def _looks_like_login(text: str) -> bool:
@@ -144,13 +141,6 @@ def _looks_like(length: int, catch_all_length: int) -> bool:
     if catch_all_length == 0:
         return length == 0
     return abs(length - catch_all_length) <= max(64, catch_all_length // 20)
-
-
-# Keep at most this many query-string variants of one (host, path). The 455
-# `?page=1..N` copies of one template all serve the same body, so probing every
-# one cost ~4h and (before dedup) reported the same secret hundreds of times. A
-# few variants still cover the case where the query genuinely changes the body.
-_MAX_VARIANTS_PER_PATH = 3
 
 
 def _select_targets(
@@ -208,7 +198,7 @@ def _authz_finding(asset: dict, url: str, status: int, next_id) -> Finding:
     )
 
 
-def inspect_assets(
+def read_bodies(
     http: Http,
     assets: list[dict],
     *,
@@ -222,16 +212,28 @@ def inspect_assets(
     missed_out: "list[str] | None" = None,
     vibe: bool = False,
     log: Callable[[str], None] | None = None,
+    done: "dict[str, list[dict]] | None" = None,
+    done_missed: "set[str] | None" = None,
+    on_result: "Callable[[str, list[dict], bool], None] | None" = None,
 ) -> tuple[list[Finding], list[str]]:
-    """Body-reading half of the active stage. ``source`` is WAYBACK or FETCH.
+    """Retrieve each endpoint body and run the content rules over it.
 
-    ``dedup`` (see ``scan_body``) collapses one templated secret across pages.
-    ``missed_out``: on a WAYBACK pass, endpoint URLs the archive had no snapshot
-    for are appended here, so the caller's active pass can fetch just those live
-    (the "catch what passive missed" half of the flow).
+    ``source`` is WAYBACK (archived snapshot; the ``scan`` stage) or FETCH (one
+    live GET; the ``probe`` stage). ``dedup`` (see ``scan_body``) collapses one
+    templated secret across pages. ``missed_out``: on a WAYBACK pass, endpoint
+    URLs the archive had no snapshot for are appended here, so the probe stage
+    can fetch just those live (the "catch what scan missed" half of the flow).
+
+    Resume (WAYBACK only): ``done`` maps an already-processed archive URL to the
+    finding dicts it produced; such URLs are replayed (findings rebuilt with
+    fresh ids, miss re-recorded) instead of re-fetched. ``on_result`` is called
+    after each freshly fetched WAYBACK URL with ``(url, finding_dicts, missed)``
+    so the caller can persist it for the next resume.
     """
     say = log or (lambda _: None)
-    next_id = next_id or FindingIds("I")
+    next_id = next_id or FindingIds("A")
+    done = done or {}
+    done_missed = done_missed or set()
     problems: list[str] = []
 
     # Direct fetch touches the target, so restrict it to high-confidence apexes;
@@ -250,10 +252,24 @@ def inspect_assets(
     # is a real path, so this keeps the "never guess paths" guarantee. Computed
     # once per host on the FETCH pass.
     home_len: dict[str, int] = {}
-    say(f"inspecting {len(targets)} endpoints via {source}...")
+    say(f"reading {len(targets)} endpoint bodies via {source}...")
 
     for i, asset in enumerate(targets, 1):
         url = asset["url"]
+
+        # Resume: this archive URL was already processed in an interrupted run.
+        # Replay its findings (with fresh ids) and miss; do not re-fetch.
+        if source == WAYBACK and url in done:
+            for d in done[url]:
+                f = Finding(**{**d, "finding_id": next_id()})
+                findings.append(f)
+                if dedup is not None:
+                    dedup.setdefault((f.org_id, f.rule, f.evidence), 1)
+            if url in done_missed and missed_out is not None:
+                missed_out.append(url)
+            say(f"  ({i}/{len(targets)}) reused {url}")
+            continue
+
         try:
             if source == FETCH:
                 status, text = body_src.fetch_body(http, url)
@@ -264,9 +280,12 @@ def inspect_assets(
             break
         say(f"  ({i}/{len(targets)}) {status or '-'} {url}")
 
-        # Archive had no usable snapshot for this URL: note it so a later active
-        # pass can fetch it live (passive could not see it).
-        if source == WAYBACK and not text and missed_out is not None:
+        url_findings: list[Finding] = []
+
+        # Archive had no usable snapshot for this URL: note it so a later probe
+        # pass can fetch it live (the scan stage could not see it).
+        missed = source == WAYBACK and not text
+        if missed and missed_out is not None:
             missed_out.append(url)
 
         # Did this 2xx really serve THIS path's content? On an SPA/catch-all the
@@ -290,7 +309,8 @@ def inspect_assets(
         # A direct fetch always yields a liveness signal; record it even when the
         # body is clean so the report can rank live exposures above stale ones.
         if source == FETCH:
-            findings.append(
+            from ..probe.verify import make_liveness_finding
+            url_findings.append(
                 make_liveness_finding(asset, url, status, next_id,
                                       source="fetch-status")
             )
@@ -303,164 +323,70 @@ def inspect_assets(
         if (source == FETCH and trust_2xx and 200 <= status < 300
                 and not _is_static_asset(url) and AUTHZ_PATH.search(url)
                 and not _looks_like_login(text)):
-            findings.append(_authz_finding(asset, url, status, next_id))
+            url_findings.append(_authz_finding(asset, url, status, next_id))
 
         # A soft-404 / index-fallback body is not this URL's content, so running
         # secret/content rules on it only re-finds the homepage. Skip.
-        if not text or (source == FETCH and not trust_2xx):
-            continue
-        # A body we just fetched is being served now; an archived snapshot is not.
-        body_freshness = "current" if source == FETCH else "archived"
-        findings.extend(
-            scan_body(
-                text,
-                asset=asset,
-                url=url,
-                status=str(status) if status else "",
-                source=body_source,
-                min_severity=min_severity,
-                next_id=next_id,
-                freshness=body_freshness,
-                dedup=dedup,
-                vibe=vibe,
-            )
-        )
-
-        # Follow a source map: minified bundles hide routes/authz from the rules,
-        # but the map's original sources restore them. This is the recall move.
-        if "sourceMappingURL" in text:
-            fetch_fn = body_src.fetch_body if source == FETCH else body_src.wayback_body
-            try:
-                map_url, sources = _read_sourcemap(fetch_fn, http, url, text)
-            except RequestBudgetExceeded as exc:
-                problems.append(f"stopped at request cap: {exc}")
-                break
-            if sources:
-                say(f"      sourcemap: {len(sources)} sources <- {map_url}")
-                findings.extend(
-                    scan_body(
-                        "\n".join(sources),
-                        asset=asset,
-                        url=map_url or url,
-                        status="",
-                        source=f"{body_source}-sourcemap",
-                        min_severity=min_severity,
-                        next_id=next_id,
-                        freshness=body_freshness,
-                        dedup=dedup,
-                        vibe=vibe,
-                    )
+        if text and not (source == FETCH and not trust_2xx):
+            # A body we just fetched is served now; an archived snapshot is not.
+            body_freshness = "current" if source == FETCH else "archived"
+            url_findings.extend(
+                scan_body(
+                    text,
+                    asset=asset,
+                    url=url,
+                    status=str(status) if status else "",
+                    source=body_source,
+                    min_severity=min_severity,
+                    next_id=next_id,
+                    freshness=body_freshness,
+                    dedup=dedup,
+                    vibe=vibe,
                 )
+            )
+
+            # Follow a source map: minified bundles hide routes/authz from the
+            # rules, but the map's original sources restore them.
+            if "sourceMappingURL" in text:
+                fetch_fn = (
+                    body_src.fetch_body if source == FETCH else body_src.wayback_body
+                )
+                try:
+                    map_url, sources = _read_sourcemap(fetch_fn, http, url, text)
+                except RequestBudgetExceeded as exc:
+                    problems.append(f"stopped at request cap: {exc}")
+                    break
+                if sources:
+                    say(f"      sourcemap: {len(sources)} sources <- {map_url}")
+                    url_findings.extend(
+                        scan_body(
+                            "\n".join(sources),
+                            asset=asset,
+                            url=map_url or url,
+                            status="",
+                            source=f"{body_source}-sourcemap",
+                            min_severity=min_severity,
+                            next_id=next_id,
+                            freshness=body_freshness,
+                            dedup=dedup,
+                            vibe=vibe,
+                        )
+                    )
+
+        findings.extend(url_findings)
+        # Persist this archive URL's result so a resume can skip it.
+        if source == WAYBACK and on_result is not None:
+            on_result(url, [f.to_dict() for f in url_findings], missed)
 
     findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
     say(f"done: {len(findings)} findings from {len(targets)} endpoints")
     return findings, problems
 
 
-@dataclass
-class InspectionResult:
-    """What one active pass produced, with reachability kept separate."""
-
-    findings: list[Finding] = field(default_factory=list)
-    liveness: list[Finding] = field(default_factory=list)
-    problems: list[str] = field(default_factory=list)
-    # Endpoint URLs the archive had no snapshot for (WAYBACK pass only). The
-    # active pass fetches these live to cover what passive could not see.
-    missed: list[str] = field(default_factory=list)
-
-    @property
-    def rows(self) -> list[Finding]:
-        return [*self.findings, *self.liveness]
-
-    @property
-    def confirmed(self) -> list[Finding]:
-        return [f for f in self.findings if f.source == "verify-confirmed"]
-
-
-def run_inspection(
-    http: Http,
-    assets: list[dict],
-    prior_findings: list[dict] | None = None,
-    *,
-    source: str = FETCH,
-    min_severity: str = "low",
-    confidence: str = "high",
-    max_targets: int = 0,  # 0 = unlimited
-    scripts_only: bool = False,
-    only_findings: bool = False,
-    restrict_body_urls: set[str] | None = None,
-    vibe: bool = False,
-    log: Callable[[str], None] | None = None,
-) -> InspectionResult:
-    """The whole active stage: body inspection + finding verification.
-
-    One ``FindingIds`` allocator is shared by both halves, so ids are unique
-    across the run.
-
-    ``restrict_body_urls`` (when not None) limits body reads to exactly those
-    URLs — the pipeline passes the archive's misses here so a FETCH pass reads
-    only what passive could not. On a WAYBACK pass the archive's misses are
-    recorded in ``result.missed`` for that later FETCH pass.
-    """
-    prior_findings = prior_findings or []
-    next_id = FindingIds("P")
-    result = InspectionResult()
-    # One dedup map for the whole pass: a secret in a shared template is counted
-    # per org, reported once (see scan_body). Shared by body inspection and
-    # verification so a value seen by both is not emitted twice.
-    dedup: dict[tuple[str, str, str], int] = {}
-
-    if restrict_body_urls is not None:
-        finding_urls: set[str] | None = restrict_body_urls
-    elif only_findings:
-        finding_urls = {
-            f.get("url", "") for f in prior_findings
-            # base_severity: an archived .git path scanned as a medium
-            # candidate is exactly what this pass exists to check.
-            if f.get("url") and base_severity(f) in ("critical", "high")
-        }
-    else:
-        finding_urls = None
-
-    # 1) endpoint bodies -> secrets/config/DB/PII/JS/authz (+ liveness in fetch)
-    rows, problems = inspect_assets(
-        http, assets, source=source, min_severity=min_severity,
-        finding_urls=finding_urls, max_targets=max_targets,
-        scripts_only=scripts_only, next_id=next_id, dedup=dedup,
-        missed_out=result.missed if source == WAYBACK else None, vibe=vibe, log=log,
-    )
-    result.problems.extend(problems)
-
-    # 2) scan findings -> reachability + known-exposure paths + unauth access.
-    # Verification always sends live requests, so it only runs on a FETCH pass.
-    if prior_findings and source == FETCH:
-        assets_by_id = {a.get("record_id", ""): a for a in assets}
-        ver, vproblems = verify_findings(
-            http, prior_findings, assets_by_id, min_severity=min_severity,
-            confidence=confidence, max_targets=max_targets,
-            next_id=next_id, dedup=dedup, vibe=vibe, log=log,
-        )
-        rows.extend(ver)
-        result.problems.extend(vproblems)
-
-    rows = _annotate_duplicates(rows, dedup)
-    suppressed = sum(n - 1 for n in dedup.values() if n > 1)
-    if suppressed:
-        result.problems.append(
-            f"같은 시크릿이 여러 페이지에 반복돼 {suppressed}건을 합쳤습니다 "
-            f"(finding당 '(+N pages)'로 표시)"
-        )
-    for row in rows:
-        (result.liveness if is_liveness(row) else result.findings).append(row)
-    result.findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
-    return result
-
-
-def _annotate_duplicates(
+def annotate_duplicates(
     rows: list[Finding], dedup: dict[tuple[str, str, str], int]
 ) -> list[Finding]:
     """Append '(+N pages)' to a finding whose secret recurred on other pages."""
-    from dataclasses import replace
     out: list[Finding] = []
     for f in rows:
         extra = dedup.get((f.org_id, f.rule, f.evidence), 1) - 1
@@ -468,3 +394,45 @@ def _annotate_duplicates(
             f = replace(f, evidence=f"{f.evidence} (+{extra} pages)")
         out.append(f)
     return out
+
+
+def scan_archive_bodies(
+    http: Http,
+    assets: list[dict],
+    *,
+    min_severity: str = "medium",
+    next_id: "Callable[[], str] | None" = None,
+    vibe: bool = False,
+    log: Callable[[str], None] | None = None,
+    done: "dict[str, list[dict]] | None" = None,
+    done_missed: "set[str] | None" = None,
+    on_result: "Callable[[str, list[dict], bool], None] | None" = None,
+) -> tuple[list[Finding], list[str], list[str]]:
+    """Archived-body pass for the ``scan`` stage.
+
+    Reads ARCHIVED snapshots (Wayback) — never the target — to pull
+    secrets/backend-config/Supabase/Firebase that URL/host/port rules cannot
+    see. The confidence floor is fixed at ``medium`` (handled by ``read_bodies``,
+    which caps a non-FETCH pass at medium).
+
+    Returns ``(findings, missed, problems)``: ``missed`` is the endpoint URLs
+    the archive had no snapshot for, so the ``probe`` stage can fetch just those.
+    ``done``/``on_result`` make the pass resumable (see ``read_bodies``).
+    """
+    next_id = next_id or FindingIds("A")
+    dedup: dict[tuple[str, str, str], int] = {}
+    missed: list[str] = []
+    findings, problems = read_bodies(
+        http, assets, source=WAYBACK, min_severity=min_severity,
+        next_id=next_id, dedup=dedup, missed_out=missed, vibe=vibe, log=log,
+        done=done, done_missed=done_missed, on_result=on_result,
+    )
+    findings = annotate_duplicates(findings, dedup)
+    suppressed = sum(n - 1 for n in dedup.values() if n > 1)
+    if suppressed:
+        problems.append(
+            f"같은 시크릿이 여러 페이지에 반복돼 {suppressed}건을 합쳤습니다 "
+            f"(finding당 '(+N pages)'로 표시)"
+        )
+    findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
+    return findings, missed, problems

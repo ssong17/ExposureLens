@@ -3,7 +3,7 @@
 The search API (``/api/v1/search/?q=domain:<apex>``) returns URLs from scans
 people ran against the domain — recent, real observations rather than a years-old
 archive. Each result carries WHEN it was scanned and the HTTP status seen, so it
-doubles as a present-tense liveness signal. Keyless (rate-limited) and passive:
+doubles as a present-tense liveness signal. Keyless (rate-limited) and no-touch:
 it reads urlscan's database, never the target.
 
 ``size`` is capped at 100 per page by the API, so a larger limit is walked with

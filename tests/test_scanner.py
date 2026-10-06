@@ -1,4 +1,4 @@
-"""Passive rules: host/path/secret detection, severity, masking, dedup."""
+"""Scan rules: host/path/secret detection, severity, masking, dedup."""
 from __future__ import annotations
 
 from exposure_lens.core.models import FindingIds
@@ -110,7 +110,7 @@ def test_secrets_in_body_still_masked():
     assert "ABCDEFGHIJKLMNOP" not in sec.evidence
 
 
-# ---- scan_body: masking and severity floor (moved from test_inspect) ---------
+# ---- scan_body: masking and severity floor (moved from the body-read tests) --
 
 def test_mask_match_keeps_key_hides_value():
     masked = _mask_match('password: "hunter2secret"')

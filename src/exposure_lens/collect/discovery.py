@@ -7,7 +7,7 @@ count and scored:
     medium  TLD class matches org_type and count >= MIN_CERTS
     low     everything else (likely sibling orgs or long tail)
 
-Collection keeps medium and above; active scanning should gate on high.
+Collection keeps medium and above; the `probe` stage gates on high.
 Scoring rationale is recorded in each candidate's ``evidence``.
 """
 from __future__ import annotations

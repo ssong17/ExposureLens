@@ -1,12 +1,13 @@
-"""Verification pass: scan findings -> live status + confirmed exposures.
+"""Verification: the half of the ``probe`` stage that confirms scan findings
+live -> live status + confirmed exposures.
 
-`scan` says a host or path *looks* sensitive; `verify` checks whether it is
-actually reachable right now and, if so, whether a known-exposure path answers
-without authentication. It is the bridge the pipeline was missing: host-level
-findings (git/CI/monitoring servers) never reach body inspection, because that
-reads endpoint bodies, so their liveness went unchecked.
+`scan` says a host or path *looks* sensitive; this verification step checks
+whether it is actually reachable right now and, if so, whether a known-exposure
+path answers without authentication. It is the bridge the pipeline was missing:
+host-level findings (git/CI/monitoring servers) never reach the body reads,
+because those reads endpoint bodies, so their liveness went unchecked.
 
-Boundaries this keeps (matching the tool's passive-first stance):
+Boundaries this keeps (matching the tool's scan-first stance):
 - One GET per probe, redirects not followed, high-confidence apexes only.
 - Only paths the finding already implies (rules.VERIFY_PROBES) — no brute force,
   no wordlist, no payload.

@@ -1,4 +1,4 @@
-"""Detection rules for the passive exposure scanner.
+"""Detection rules for the scan stage (never touches the target).
 
 Three rule sets, all matched against data already collected (never by touching
 the target): sensitive hostnames, sensitive URL paths, and secrets leaked in
@@ -202,7 +202,8 @@ SECRET_RULES = _rules(
 )
 
 # Matched against RESPONSE BODIES (JS bundles, config files, JSON responses,
-# archived pages). This is what `inspect` runs after reading a body — the URL
+# archived pages). This is what the body passes (`scan` archive + `probe` live)
+# run after reading a body — the URL
 # rules above only see the address, these see what the address serves. Patterns
 # stay high-signal because bodies are large and noisy; every match is masked
 # before it is recorded, and secrets are never verified.
@@ -265,7 +266,7 @@ CONTENT_RULES = _rules(
     ]
 )
 
-# Recall-focused signals for `inspect` on client code (JS bundles, source maps,
+# Recall-focused signals for the body passes on client code (JS bundles, source maps,
 # HTML). These map the app's own attack surface — the part host/URL names cannot
 # reach. They are NOT masked (the value IS the finding: a route, a URL, a check),
 # and they lean toward over-flagging on purpose: missing a real exposure costs
@@ -364,24 +365,53 @@ VERIFY_DEFAULT_PROBE = [("/", "low", "exposed-service", "verify-root")]
 # Internet-facing ports that should almost never be public. Used by `services`
 # to turn Shodan InternetDB's CURRENT port list into findings — this is present
 # exposure (a third party scanned it recently), not an archived trace.
+#
+# Scope note: the free InternetDB API only reports the OPEN-PORT list for an IP.
+# Application-layer exposures that need the response body or a banner — an open
+# directory listing (autoindex), an unauthenticated phpMyAdmin/Adminer, a public
+# S3 bucket index — cannot be confirmed from the port number alone and so are
+# NOT inferred here (a 80/443 being open says nothing about what it serves). Those
+# belong to a paid no-touch source (Censys, the full Shodan API) and, since they
+# never contact the target, would be added to this `scan` stage when such an API
+# key is available.
+# Until then we strengthen the port coverage that the free API CAN answer.
 RISKY_PORTS: dict[int, tuple[str, str]] = {
+    # remote access / legacy
     23: ("high", "telnet"), 21: ("medium", "ftp"), 445: ("high", "smb"),
-    3389: ("high", "rdp"), 5900: ("high", "vnc"), 512: ("high", "rexec"),
+    139: ("high", "netbios-smb"), 135: ("medium", "msrpc"),
+    3389: ("high", "rdp"), 5900: ("high", "vnc"), 5901: ("high", "vnc"),
+    512: ("high", "rexec"), 513: ("high", "rlogin"), 514: ("high", "rsh"),
+    5555: ("critical", "android-adb"),  # adb = remote shell, often unauthenticated
+    # databases
     3306: ("critical", "mysql"), 5432: ("critical", "postgres"),
     1433: ("critical", "mssql"), 1521: ("critical", "oracle-db"),
     6379: ("critical", "redis"), 27017: ("critical", "mongodb"),
+    27018: ("critical", "mongodb-shard"),
+    9042: ("critical", "cassandra"), 7000: ("high", "cassandra-internode"),
+    7474: ("critical", "neo4j-http"), 7687: ("critical", "neo4j-bolt"),
+    8529: ("critical", "arangodb"), 9160: ("high", "cassandra-thrift"),
+    # search / cache / queues
     9200: ("critical", "elasticsearch"), 9300: ("high", "elasticsearch-transport"),
     5984: ("critical", "couchdb"), 11211: ("critical", "memcached"),
     8086: ("high", "influxdb"), 9092: ("high", "kafka"), 2181: ("high", "zookeeper"),
     5601: ("high", "kibana"), 15672: ("high", "rabbitmq-mgmt"),
+    5672: ("high", "amqp"), 1883: ("high", "mqtt"), 8883: ("high", "mqtt-tls"),
+    61616: ("high", "activemq-openwire"),
+    # container / orchestration
     2375: ("critical", "docker-api"), 2376: ("critical", "docker-api"),
     6443: ("high", "kubernetes-api"), 10250: ("high", "kubelet"),
+    2379: ("critical", "etcd"),
+    # app servers / big-data / infra
     7001: ("high", "weblogic"), 8161: ("medium", "activemq"),
-    50070: ("high", "hadoop-hdfs"), 9000: ("medium", "service-9000"),
+    50070: ("high", "hadoop-hdfs"), 8088: ("high", "hadoop-yarn"),
+    9000: ("medium", "service-9000"),
+    161: ("medium", "snmp"), 389: ("medium", "ldap"), 636: ("medium", "ldaps"),
+    111: ("medium", "rpcbind"), 2049: ("high", "nfs"), 873: ("medium", "rsync"),
+    69: ("medium", "tftp"), 548: ("medium", "afp"),
 }
 
 
-# Path patterns that should sit behind authentication. `inspect --source fetch`
+# Path patterns that should sit behind authentication. `probe` (live fetch)
 # flags one of these only when the live status code says it is reachable
 # unauthenticated (2xx) instead of challenged (301/302/401/403).
 AUTHZ_PATH = re.compile(

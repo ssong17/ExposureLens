@@ -1,13 +1,13 @@
-"""Response-body fetchers for `inspect`.
+"""Response-body fetchers for the body-reading passes (``scan.bodyscan``).
 
 Two strategies, both read-only:
 
-- ``wayback_body``  reads the archived snapshot from web.archive.org. Fully
-  passive: the target is never contacted, only the Internet Archive. The
-  ``id_`` modifier returns the original bytes without the Wayback toolbar.
-- ``fetch_body``    issues exactly one GET to the target itself. This touches
-  the target, so `inspect` gates it behind an explicit flag and high-confidence
-  apexes only. Redirects are not followed, so the raw status is preserved.
+- ``wayback_body``  reads the archived snapshot from web.archive.org (the `scan`
+  archived-body pass): the target is never contacted, only the Internet Archive.
+  The ``id_`` modifier returns the original bytes without the Wayback toolbar.
+- ``fetch_body``    issues exactly one GET to the target itself (the `probe`
+  pass). This touches the target, so it is gated to high-confidence apexes only.
+  Redirects are not followed, so the raw status is preserved.
 
 Neither verifies a credential or sends a payload; they retrieve a body so the
 content rules can read it.

@@ -1,7 +1,8 @@
 """Command-line entry point: argument parsing and stage orchestration only.
 
-Report formatting lives in ``report.summary``, merge logic in ``collect.merge``
-and the active stage in ``scan.inspect``. This file wires them together.
+Report formatting lives in ``report.summary``, merge logic in ``collect.merge``,
+the scan-stage body pass in ``scan.bodyscan`` and the probe stage in
+``probe.prober``. This file wires them together.
 
 Output layout: ``output/YYYYMMDD/<HHMMSS>_<stage>.jsonl`` and
 ``<HHMMSS>_<stage>_summary.md``. The time prefix makes each run's files easy to
@@ -51,7 +52,8 @@ from .report.summary import (
     print_findings,
     write_findings_summary,
 )
-from .probe.inspect import FETCH, WAYBACK, run_inspection
+from .probe.prober import run_probe
+from .scan.bodyscan import scan_archive_bodies
 from .scan.scanner import scan_assets
 from .scan.services import build_ip_index, check_exposure
 
@@ -132,22 +134,16 @@ def _add_vibe(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_probe_options(parser: argparse.ArgumentParser, *, full: bool) -> None:
-    """Options for the active stage, shared by `probe` and `run --probe`.
+    """Options for the probe stage, shared by `probe` and `run --probe`.
 
-    There is no volume cap any more (that lived here as --max-targets): a run
-    processes everything found and pauses between organizations instead.
+    The apex-confidence floor is fixed at high (live fetches must never touch a
+    host that might not be this org's), so there is no `--confidence` knob. The
+    archived-body source now belongs to the `scan` stage, so there is no
+    `--source` knob either — `probe` always fetches live. There is no volume cap
+    (a run processes everything found and pauses between organizations instead).
     """
-    parser.add_argument(
-        "--confidence", choices=["high", "medium", "low"], default="high",
-        help="only probe assets/findings at or above this apex confidence "
-        "(default: high)",
-    )
     if not full:
         return
-    parser.add_argument(
-        "--source", choices=[FETCH, WAYBACK], default=FETCH,
-        help="body source: fetch = live GET, current (default); wayback = archived",
-    )
     parser.add_argument(
         "--scripts", action="store_true",
         help="only read client-code endpoints (.js/.json/.map) for JS/authz rules",
@@ -170,14 +166,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser(
         "run",
-        help="the whole pipeline: collect -> scan (add --probe for the active "
-        "live stage). Defaults to all enabled orgs.",
+        help="the whole pipeline: collect -> scan (add --probe for the live "
+        "probe stage). Defaults to all enabled orgs.",
     )
     run.add_argument("--config", "-i", default=DEFAULT_CONFIG)
     _add_scope(run, required=False)
     run.add_argument(
         "--probe", action="store_true",
-        help="also run the active stage — identical to the `probe` command",
+        help="also run the probe stage — identical to the `probe` command",
     )
     _add_probe_options(run, full=False)
     run.add_argument(
@@ -190,10 +186,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--search-query", action="append", metavar="KW", help="search keyword/template to use with --search (repeatable). A bare keyword becomes site:apex \"KW\"; a value with {apex} is a full template. Overrides config search_queries")
     run.add_argument(
         "--no-archive-bodies", action="store_true",
-        help="skip the passive archived-body pass (Wayback). By default `run` "
-        "reads archived bodies to extract secrets/backend-config without "
-        "touching the target; --probe then only confirms these live and fetches "
-        "endpoints the archive lacked",
+        help="skip the scan stage's archived-body pass (Wayback). "
+        "By default scan reads archived bodies to extract secrets/backend-config "
+        "without touching the target; --probe then only confirms these live and "
+        "fetches endpoints the archive lacked",
     )
     run.add_argument(
         "--fresh", action="store_true",
@@ -240,12 +236,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_resume(collect)
     _add_common(collect)
 
-    # scan = offline host/URL rules + current services (Shodan). No request to
-    # the target; findings and their summary come out together.
+    # scan = no-touch stage. Offline host/URL rules + current services (Shodan
+    # InternetDB) + archived response bodies (Wayback). No request to the
+    # target; findings and their summary come out together.
     scan = sub.add_parser(
         "scan",
-        help="analyse collected assets: host/URL rules + current open services "
-        "(Shodan InternetDB). Does not touch the target.",
+        help="SCAN (no target contact): analyse collected assets — "
+        "host/URL rules + current open services (Shodan InternetDB) + archived "
+        "response bodies (Wayback).",
     )
     scan.add_argument("--config", "-i", default=DEFAULT_CONFIG)
     scan.add_argument(
@@ -258,16 +256,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan.add_argument(
         "--no-services", action="store_true",
-        help="skip the Shodan current-services check (pure offline rules)",
+        help="skip the Shodan current-services check",
+    )
+    scan.add_argument(
+        "--no-archive-bodies", action="store_true",
+        help="skip the archived-body pass (Wayback). By default scan "
+        "reads archived snapshots to extract secrets/backend-config the "
+        "host/URL rules cannot see, without touching the target",
     )
     _add_resume(scan)
     _add_vibe(scan)
     _add_common(scan)
 
-    # probe = the active stage: live GET to the target.
+    # probe = the target-touching stage: live GET to the target.
     probe = sub.add_parser(
         "probe",
-        help="ACTIVE: live-GET the target to check current exposure — endpoint "
+        help="PROBE: live-GET the target to check current exposure — endpoint "
         "bodies/JS + finding reachability + unauthenticated access. "
         "high-confidence apexes only.",
     )
@@ -535,16 +539,23 @@ def _run_collect(app: AppConfig, args: argparse.Namespace) -> int:
 def _scan_stage(
     app: AppConfig, args: argparse.Namespace, assets: list[dict], http: Http | None,
     progress: ScanProgress | None = None,
-) -> tuple[list, list[str]]:
-    """Offline host/URL rules plus, unless disabled, current open services.
+) -> tuple[list, list[str], set[str] | None]:
+    """The scan stage: offline host/URL rules, plus (unless disabled) current
+    open services (Shodan) and the archived-body pass (Wayback). Never touches
+    the target.
 
-    ``progress`` records each Shodan answer as it arrives and supplies the ones
-    an interrupted run already got, so a resume only queries the rest. A
-    ``NetworkDown`` propagates to the caller.
+    Returns ``(findings, problems, archive_missed)``. ``archive_missed`` is the
+    set of endpoint URLs the archive had no snapshot for, which the ``probe``
+    stage fetches live — or ``None`` when the archive pass did not run (then the
+    probe stage reads every body). ``progress`` records each Shodan
+    answer and each archived-body URL as they arrive and supplies the ones an
+    interrupted run already got, so a resume only does the rest. A
+    ``NetworkDown`` propagates.
     """
     findings = scan_assets(assets, min_severity=args.min_severity,
                            vibe=getattr(args, "vibe", False))
     problems: list[str] = []
+    archive_missed: set[str] | None = None
     if not args.no_services and http is not None:
         print(
             "note: current-services check reads Shodan InternetDB (third-party "
@@ -559,14 +570,41 @@ def _scan_stage(
         )
         findings.extend(svc)
         problems.extend(sprob)
+    if not getattr(args, "no_archive_bodies", False) and http is not None:
+        print(
+            "\nscan - reading archived snapshots (Wayback; never contacts the "
+            "target)...",
+            file=sys.stderr,
+        )
+        http.clear_cache()
+        arch, missed, aprob = scan_archive_bodies(
+            http, assets, min_severity=args.min_severity,
+            vibe=getattr(args, "vibe", False), log=_logger(args.quiet),
+            done=progress.arch if progress else None,
+            done_missed=progress.arch_missed if progress else None,
+            on_result=progress.record_archive if progress else None,
+        )
+        findings.extend(arch)
+        problems.extend(aprob)
+        archive_missed = set(missed)
+        print(
+            f"scan archive - {len(arch)} findings "
+            f"({_severity_breakdown(arch)}); {len(archive_missed)} endpoints "
+            f"had no snapshot"
+        )
     findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
-    return findings, problems
+    return findings, problems, archive_missed
+
+
+def _scan_needs_network(args: argparse.Namespace) -> bool:
+    """True when the scan stage has a slow network path (Shodan or archive)."""
+    return not args.no_services or not getattr(args, "no_archive_bodies", False)
 
 
 def _start_scan_progress(
     args: argparse.Namespace, out_dir: Path, assets_path: str,
 ) -> ScanProgress | None:
-    if args.no_services:
+    if not _scan_needs_network(args):
         return None  # offline rules only: nothing slow to resume
     return ScanProgress.start(_f(out_dir, args, "scan.progress.jsonl"), assets_path)
 
@@ -577,15 +615,19 @@ def _run_scan(app: AppConfig, args: argparse.Namespace) -> int:
         out_dir = _adopt(args, path, SCAN_SUFFIX)
         progress = ScanProgress.load(path)
         assets_path = args.assets or progress.assets_path
-        print(f"이어서 scan: Shodan {len(progress.answers)}개 IP 응답 재사용", file=sys.stderr)
+        print(
+            f"이어서 scan: Shodan {len(progress.answers)}개 IP 응답 + "
+            f"아카이브 {len(progress.arch)}개 URL 재사용",
+            file=sys.stderr,
+        )
     else:
         assets_path = args.assets or _latest_output(args.output, "collect")
         out_dir = _out_dir(args)
         progress = _start_scan_progress(args, out_dir, assets_path)
     assets = read_jsonl(assets_path)
-    http = None if args.no_services else _make_http(app, quiet=args.quiet)
+    http = None if not _scan_needs_network(args) else _make_http(app, quiet=args.quiet)
     try:
-        findings, problems = _scan_stage(app, args, assets, http, progress)
+        findings, problems, _missed = _scan_stage(app, args, assets, http, progress)
     except NetworkDown as exc:
         return _report(out_dir, http, [f"scan 중단: {exc}"], code=EXIT_NETWORK_DOWN)
     if progress:
@@ -615,16 +657,14 @@ _LIVE_GET_NOTE = (
 def _probe_stage(
     app: AppConfig, args: argparse.Namespace, http: Http,
     assets: list[dict], prior: list[dict],
-    *, source: str = FETCH, min_severity: str = "low",
+    *, min_severity: str = "low", restrict_body_urls: set[str] | None = None,
 ):
-    """The active stage, shared by the `probe` command and `run --probe`."""
-    if source == FETCH:
-        print(_LIVE_GET_NOTE, file=sys.stderr)
-    return run_inspection(
+    """The probe stage, shared by the `probe` command and `run --probe`."""
+    print(_LIVE_GET_NOTE, file=sys.stderr)
+    return run_probe(
         http, assets, prior,
-        source=source,
         min_severity=min_severity,
-        confidence=args.confidence,
+        restrict_body_urls=restrict_body_urls,
         scripts_only=getattr(args, "scripts", False),
         only_findings=getattr(args, "only_findings", False),
         vibe=getattr(args, "vibe", False),
@@ -652,72 +692,36 @@ def _run_probe(app: AppConfig, args: argparse.Namespace) -> int:
 
     http = _make_http(app, quiet=args.quiet)
     result = _probe_stage(
-        app, args, http, assets, prior,
-        source=args.source, min_severity=args.min_severity,
+        app, args, http, assets, prior, min_severity=args.min_severity,
     )
 
     out_dir = _out_dir(args)
     _write_probe_output(out_dir, args, result, app.orgs)
 
     print(
-        f"probed via {args.source} - {len(result.findings)} findings "
+        f"probed - {len(result.findings)} findings "
         f"({_severity_breakdown(result.findings)}; {len(result.confirmed)} confirmed)"
     )
     print_findings(result.rows, print, limit=40)
     return _report(out_dir, http, result.problems)
 
 
-def _passive_body_stage(
-    app: AppConfig, args: argparse.Namespace, http: Http,
-    assets: list[dict], findings: list, problems: list[str],
-) -> set[str] | None:
-    """Read ARCHIVED bodies (Wayback) — never touches the target — to pull
-    secrets/backend-config/Supabase/Firebase that URL/host/port rules cannot
-    see. Part of passive extraction, so it runs even without --probe; its
-    findings are appended to ``findings`` (re-sorted). Returns the set of
-    endpoint URLs the archive had no snapshot for, so the active pass can fetch
-    just those — or None when the pass is skipped (then active reads all).
-    """
-    if args.no_archive_bodies:
-        return None
-    print("\npassive bodies - reading archived snapshots (Wayback; no target contact)...")
-    http.clear_cache()
-    arch = run_inspection(
-        http, assets, [], source=WAYBACK,
-        min_severity=args.min_severity, confidence=args.confidence,
-        vibe=getattr(args, "vibe", False),
-        log=_logger(args.quiet),
-    )
-    findings.extend(arch.findings)  # archive-body findings are passive candidates
-    findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
-    problems.extend(arch.problems)
-    print(
-        f"passive bodies - {len(arch.findings)} findings "
-        f"({_severity_breakdown(arch.findings)}); "
-        f"{len(arch.missed)} endpoints had no snapshot"
-    )
-    return set(arch.missed)
-
-
-def _active_probe_stage(
+def _pipeline_probe_stage(
     app: AppConfig, args: argparse.Namespace, http: Http, out_dir: Path,
-    assets: list[dict], passive_findings: list, archive_missed: set[str] | None,
+    assets: list[dict], scan_findings: list, archive_missed: set[str] | None,
     problems: list[str],
 ) -> None:
-    """Active pass: confirm the passive candidates live AND fetch the bodies the
-    archive missed. When the archive pass ran, live body reads are restricted to
-    its misses (no re-fetching what passive already covered); with
-    --no-archive-bodies there were no misses to track, so it reads all.
+    """Probe pass in the pipeline: confirm the scan candidates live AND fetch the
+    bodies the archive missed. When the archive pass ran, live body reads are
+    restricted to its misses (no re-fetching what the scan archive pass already
+    covered); with --no-archive-bodies there were no misses to track, so it reads
+    all.
     """
-    print("\nprobe - active: confirm passive candidates + fetch archive misses...")
-    print(_LIVE_GET_NOTE, file=sys.stderr)
+    print("\nprobe - confirm scan candidates + fetch archive misses...")
     http.clear_cache()
-    result = run_inspection(
-        http, assets, [f.to_dict() for f in passive_findings],
-        source=FETCH, min_severity=args.min_severity, confidence=args.confidence,
-        restrict_body_urls=archive_missed,
-        vibe=getattr(args, "vibe", False),
-        log=_logger(args.quiet),
+    result = _probe_stage(
+        app, args, http, assets, [f.to_dict() for f in scan_findings],
+        min_severity=args.min_severity, restrict_body_urls=archive_missed,
     )
     _write_probe_output(out_dir, args, result, app.orgs)
     problems.extend(result.problems)
@@ -785,7 +789,9 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
 
     http.clear_cache()  # index pages are done with; do not carry them further
     try:
-        findings, sproblems = _scan_stage(app, args, asset_dicts, http, scan_progress)
+        findings, sproblems, archive_missed = _scan_stage(
+            app, args, asset_dicts, http, scan_progress
+        )
     except NetworkDown as exc:
         problems.append(f"scan 중단: {exc}")
         return _report(out_dir, http, problems, code=EXIT_NETWORK_DOWN)
@@ -793,10 +799,8 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
         scan_progress.finish()
     problems.extend(sproblems)
 
-    archive_missed = _passive_body_stage(app, args, http, asset_dicts, findings, problems)
-
-    write_jsonl(findings, _f(out_dir, args, "scan.jsonl"))  # full passive candidate set
-    print(f"passive total - {len(findings)} findings ({_severity_breakdown(findings)})")
+    write_jsonl(findings, _f(out_dir, args, "scan.jsonl"))  # full scan candidate set
+    print(f"scan total - {len(findings)} findings ({_severity_breakdown(findings)})")
     print_findings(findings, print, limit=20)
     write_findings_summary(
         _f(out_dir, args, "scan_summary.md"), f"scan - {run_date()}", findings,
@@ -804,7 +808,7 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
     )
 
     if args.probe:
-        _active_probe_stage(
+        _pipeline_probe_stage(
             app, args, http, out_dir, asset_dicts, findings, archive_missed, problems
         )
 
