@@ -649,22 +649,22 @@ def _run_scan(app: AppConfig, args: argparse.Namespace) -> int:
 
 
 _LIVE_GET_NOTE = (
-    "note: probe sends LIVE GETs to the target (high-confidence apexes only; "
-    "one request per endpoint/path; no new-path guessing, no payloads)."
+    "note: probe sends LIVE GETs to the target (high-confidence apexes only; one "
+    "request per URL — collected endpoints, the host root, finding-implied paths, "
+    "and same-origin scripts a page links; no path guessing, no payloads)."
 )
 
 
 def _probe_stage(
     app: AppConfig, args: argparse.Namespace, http: Http,
     assets: list[dict], prior: list[dict],
-    *, min_severity: str = "low", restrict_body_urls: set[str] | None = None,
+    *, min_severity: str = "low",
 ):
     """The probe stage, shared by the `probe` command and `run --probe`."""
     print(_LIVE_GET_NOTE, file=sys.stderr)
     return run_probe(
         http, assets, prior,
         min_severity=min_severity,
-        restrict_body_urls=restrict_body_urls,
         scripts_only=getattr(args, "scripts", False),
         only_findings=getattr(args, "only_findings", False),
         vibe=getattr(args, "vibe", False),
@@ -708,20 +708,18 @@ def _run_probe(app: AppConfig, args: argparse.Namespace) -> int:
 
 def _pipeline_probe_stage(
     app: AppConfig, args: argparse.Namespace, http: Http, out_dir: Path,
-    assets: list[dict], scan_findings: list, archive_missed: set[str] | None,
-    problems: list[str],
+    assets: list[dict], scan_findings: list, problems: list[str],
 ) -> None:
-    """Probe pass in the pipeline: confirm the scan candidates live AND fetch the
-    bodies the archive missed. When the archive pass ran, live body reads are
-    restricted to its misses (no re-fetching what the scan archive pass already
-    covered); with --no-archive-bodies there were no misses to track, so it reads
-    all.
+    """Probe pass in the pipeline: one live pass over every collected endpoint
+    plus the paths the scan candidates imply (confirm reachability / unauth
+    access / known-exposure, read bodies). The scan stage already extracted what
+    the archive held; probe re-checks everything live for present truth.
     """
-    print("\nprobe - confirm scan candidates + fetch archive misses...")
+    print("\nprobe - live pass over collected endpoints + scan candidates...")
     http.clear_cache()
     result = _probe_stage(
         app, args, http, assets, [f.to_dict() for f in scan_findings],
-        min_severity=args.min_severity, restrict_body_urls=archive_missed,
+        min_severity=args.min_severity,
     )
     _write_probe_output(out_dir, args, result, app.orgs)
     problems.extend(result.problems)
@@ -789,7 +787,7 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
 
     http.clear_cache()  # index pages are done with; do not carry them further
     try:
-        findings, sproblems, archive_missed = _scan_stage(
+        findings, sproblems, _archive_missed = _scan_stage(
             app, args, asset_dicts, http, scan_progress
         )
     except NetworkDown as exc:
@@ -809,7 +807,7 @@ def _run_pipeline(app: AppConfig, args: argparse.Namespace) -> int:
 
     if args.probe:
         _pipeline_probe_stage(
-            app, args, http, out_dir, asset_dicts, findings, archive_missed, problems
+            app, args, http, out_dir, asset_dicts, findings, problems
         )
 
     write_summary(

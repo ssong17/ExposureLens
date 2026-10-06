@@ -453,6 +453,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "exposed-service": "열린 서비스 포트",
     "shared-service": "열린 포트(공유 IP·귀속 미확정)",
     "access-control": "인증 없이 열린 경로",
+    "auth-panel": "도달 가능한 로그인/인증 페이지(크리덴셜 스터핑 표면)",
     "liveness": "접속 상태",
 }
 

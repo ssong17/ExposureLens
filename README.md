@@ -132,7 +132,7 @@ exposure-lens scan --resume          # 끊긴 곳부터 (Shodan·아카이브 �
 
 ### probe — 라이브 GET (대상 접촉)
 
-high confidence apex만, 엔드포인트/경로당 한 번, 새 경로 추측·payload 없음.
+high confidence apex만, URL당 GET 1회, 새 경로 추측·payload 없음. **한 번의 패스**로 수집된 엔드포인트 전체(과거/현재 무관) + scan 후보가 함의하는 정확한 경로(git→`/.git/config` 등)를 라이브로 확인한다 — 도달성, 인증 없는 2xx, 알려진-노출 확정, 본문 룰(시크릿·백엔드·DB·PII·클라이언트코드), 소스맵 추적을 한 번에. 보호경로가 2xx인데 **로그인 폼**이면 "열림"이 아니라 `auth-panel`(크리덴셜 스터핑 표면)로 기록한다. 호스트 홈(`/`)을 1회 받아 SPA/soft-404 기준선 겸 **같은-오리진 `<script src>`를 전부** 추가로 읽어 아카이브가 못 본 공개 스크립트를 보강한다(스크립트 본문은 URL마다 1 GET이지만 호스트당 `request_interval_seconds` 간격으로 띄워 나가므로 버스트가 아님. 교차 오리진 CDN 스크립트는 받지 않음).
 
 ```bash
 exposure-lens probe

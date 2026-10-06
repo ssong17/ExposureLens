@@ -4,8 +4,6 @@ resume."""
 from __future__ import annotations
 
 from exposure_lens.scan.bodyscan import (
-    FETCH,
-    WAYBACK,
     _select_targets,
     read_bodies,
     scan_archive_bodies,
@@ -75,15 +73,14 @@ def test_select_targets_only_findings_filter():
     assert [t["record_id"] for t in picked] == ["E2"]
 
 
-# ---- read_bodies end-to-end via fake http ------------------------------------
+# ---- read_bodies: WAYBACK/archive only (live FETCH lives in test_probe_stage) -
 
-def test_read_bodies_wayback_finds_secret_in_snapshot():
+def test_read_bodies_finds_secret_in_snapshot():
     body = 'const k = "AKIAABCDEFGHIJKLMNOP";'
     http = FakeHttp({"https://a.x.com/app.js": (200, body, "application/javascript")})
     findings, problems = read_bodies(
         http,
         [_endpoint("E1", "https://a.x.com/app.js")],
-        source=WAYBACK,
         min_severity="low",
     )
     assert not problems
@@ -92,34 +89,7 @@ def test_read_bodies_wayback_finds_secret_in_snapshot():
     )
 
 
-def test_read_bodies_fetch_flags_unauthenticated_admin():
-    http = FakeHttp({"https://a.x.com/admin/users": (200, "<html>admin</html>", "text/html")})
-    findings, _ = read_bodies(
-        http,
-        [_endpoint("E1", "https://a.x.com/admin/users")],
-        source=FETCH,
-        min_severity="low",
-    )
-    authz = [f for f in findings if f.category == "access-control"]
-    assert authz and authz[0].severity == "high" and authz[0].status == "200"
-
-
-def test_read_bodies_fetch_no_authz_flag_when_redirected():
-    http = FakeHttp({"https://a.x.com/admin": (302, "", "text/html")})
-    findings, _ = read_bodies(
-        http, [_endpoint("E1", "https://a.x.com/admin")], source=FETCH, min_severity="low",
-    )
-    assert not any(f.category == "access-control" for f in findings)
-
-
-def test_read_bodies_max_targets_caps_and_reports():
-    assets = [_endpoint(f"E{i}", f"https://a.x.com/{i}.js") for i in range(5)]
-    http = FakeHttp({})
-    _, problems = read_bodies(http, assets, source=WAYBACK, max_targets=2)
-    assert any("capped targets" in p for p in problems)
-
-
-def test_read_bodies_follows_inline_sourcemap():
+def test_read_bodies_follows_sourcemap_from_archive():
     import base64
     import json
 
@@ -130,13 +100,9 @@ def test_read_bodies_follows_inline_sourcemap():
     minified = "function A(u){}\n//# sourceMappingURL=data:application/json;base64," + sm
     http = FakeHttp({"https://h/app.js": (200, minified, "application/javascript")})
     findings, _ = read_bodies(
-        http,
-        [_endpoint("E1", "https://h/app.js")],
-        source=FETCH,
-        min_severity="low",
+        http, [_endpoint("E1", "https://h/app.js")], min_severity="low",
     )
     sm_cats = {f.category for f in findings if f.source and "sourcemap" in f.source}
-    # The minified bundle hid these; the source map restores them.
     assert {"client-authz", "api-endpoint"} <= sm_cats
 
 

@@ -167,11 +167,8 @@ def test_run_probe_uses_the_same_stage_as_probe(tmp_path, no_network, monkeypatc
     ])
     assert code == 0
     # The pipeline hands the full asset list to the same entry point the
-    # `probe` command uses. The probe pass is always a live fetch now (no
-    # source knob), and with the archive pass off it reads every body
-    # (restrict_body_urls=None) rather than only the archive's misses.
+    # `probe` command uses — one live pass over everything (no restrict knob).
     assert seen["assets"] == 2
-    assert seen["restrict_body_urls"] is None
 
 
 def test_scan_writes_summary_without_liveness_bullets(
