@@ -246,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
         "response bodies (Wayback).",
     )
     scan.add_argument("--config", "-i", default=DEFAULT_CONFIG)
+    _add_scope(scan, required=False)
     scan.add_argument(
         "--assets", "-a",
         help="collect JSONL to scan (default: the latest collect output)",
@@ -276,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
         "high-confidence apexes only.",
     )
     probe.add_argument("--config", "-i", default=DEFAULT_CONFIG)
+    _add_scope(probe, required=False)
     probe.add_argument(
         "--assets", "-a",
         help="collect JSONL (endpoints to read; default: latest collect)",
@@ -300,6 +302,31 @@ def _select(app: AppConfig, args: argparse.Namespace) -> tuple[OrgConfig, ...]:
     if getattr(args, "group", None):
         return app.get_group(args.group)
     return app.get_enabled()
+
+
+def _scope_ids(app: AppConfig, args: argparse.Namespace) -> set[str] | None:
+    """Org-ids to keep when a scope flag (--org/--group/--all-enabled) was given
+    on scan/probe, else None (use every asset in the input file unchanged)."""
+    if (getattr(args, "org", None) or getattr(args, "group", None)
+            or getattr(args, "all_enabled", False)):
+        return {o.org_id for o in _select(app, args)}
+    return None
+
+
+def _apply_scope(
+    ids: set[str] | None, rows: list[dict], label: str, quiet: bool
+) -> list[dict]:
+    """Keep only rows of the selected orgs. A no-op when ``ids`` is None."""
+    if ids is None:
+        return rows
+    kept = [r for r in rows if r.get("org_id") in ids]
+    if not quiet:
+        print(
+            f"scope: {len(kept)}/{len(rows)} {label} in selected org(s) "
+            f"({', '.join(sorted(ids))})",
+            file=sys.stderr,
+        )
+    return kept
 
 
 def _make_http(app: AppConfig, *, quiet: bool = False) -> Http:
@@ -417,11 +444,15 @@ def _collect_stage(
 
     Returns (assets, problems, network_down). Accumulate by default (public
     indexes fail differently each run, so the union is the real coverage;
-    ``--fresh`` opts out). Two checkpoints are kept: the collect JSONL after
-    every org, and a progress file after every apex, which ``--resume`` reads to
-    skip finished orgs/apexes. Rest ``org_pause_seconds`` between orgs —
-    sequential-with-rest is what replaced the request cap, so a full run
-    finishes without hammering the free-tier indexes into rate-limiting.
+    ``--fresh`` opts out) — but ONLY within the selected scope: a prior collect's
+    other organizations are NOT carried in, so ``--org naver`` yields a
+    naver-only result (and ``scan``/``probe`` on it stay naver-only) instead of
+    dragging every org ever collected into this run. Two checkpoints are kept:
+    the collect JSONL after every org, and a progress file after every apex,
+    which ``--resume`` reads to skip finished orgs/apexes. Rest
+    ``org_pause_seconds`` between orgs — sequential-with-rest is what replaced
+    the request cap, so a full run finishes without hammering the free-tier
+    indexes into rate-limiting.
     """
     log = _logger(args.quiet)
     say = log or (lambda _: None)
@@ -430,10 +461,18 @@ def _collect_stage(
     progress_path = _f(out_dir, args, "collect.progress.json")
     problems: list[str] = []
 
+    orgs = _select(app, args)
+    selected_ids = {o.org_id for o in orgs}
+
+    def _in_scope(rows: list[dict]) -> list[dict]:
+        # Keep only the orgs this run targets; a shared output root otherwise
+        # merges every past org's assets into a single-org run (and then scan).
+        return [a for a in rows if a.get("org_id") in selected_ids]
+
     if getattr(args, "resume", False) and progress_path.exists():
         progress = CollectProgress.load(progress_path)
         source = out_path if out_path.exists() else Path(progress.base or out_path)
-        accumulated = read_jsonl(source) if source.exists() else []
+        accumulated = _in_scope(read_jsonl(source)) if source.exists() else []
         started_with = 0
         say(
             f"이어서 수집: 완료 {len(progress.orgs_done)}개 기관 건너뜀, "
@@ -445,7 +484,7 @@ def _collect_stage(
         if not args.fresh:
             try:
                 base = _latest_output(args.output, "collect")
-                accumulated = read_jsonl(base)
+                accumulated = _in_scope(read_jsonl(base))
             except ValueError:
                 accumulated = []
         progress = CollectProgress(progress_path, base=base)
@@ -454,8 +493,6 @@ def _collect_stage(
     collected = 0
     down = False
     first = True
-
-    orgs = _select(app, args)
     for org in orgs:
         if org.org_id in progress.orgs_done:
             continue
@@ -624,7 +661,8 @@ def _run_scan(app: AppConfig, args: argparse.Namespace) -> int:
         assets_path = args.assets or _latest_output(args.output, "collect")
         out_dir = _out_dir(args)
         progress = _start_scan_progress(args, out_dir, assets_path)
-    assets = read_jsonl(assets_path)
+    assets = _apply_scope(_scope_ids(app, args), read_jsonl(assets_path),
+                          "assets", args.quiet)
     http = None if not _scan_needs_network(args) else _make_http(app, quiet=args.quiet)
     try:
         findings, problems, _missed = _scan_stage(app, args, assets, http, progress)
@@ -689,6 +727,9 @@ def _run_probe(app: AppConfig, args: argparse.Namespace) -> int:
         prior = read_jsonl(args.findings or _latest_output(args.output, "scan"))
     except ValueError:
         prior = []
+    ids = _scope_ids(app, args)
+    assets = _apply_scope(ids, assets, "assets", args.quiet)
+    prior = _apply_scope(ids, prior, "findings", args.quiet)
 
     http = _make_http(app, quiet=args.quiet)
     result = _probe_stage(

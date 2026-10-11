@@ -134,6 +134,23 @@ def test_collect_accumulates_by_default(tmp_path, no_network, monkeypatch, capsy
     assert hosts == {"a.x.com", "git.x.com", "new.x.com"}
 
 
+def test_scoped_run_does_not_pull_in_other_orgs(tmp_path, no_network, capsys):
+    """Regression: `--org x` accumulated a prior collect's OTHER orgs (so scan
+    then saw them). A scoped run must keep only its own scope."""
+    out = tmp_path / "out"
+    # a prior collect under the same output root holds a foreign org's asset
+    (out / "20260101").mkdir(parents=True)
+    (out / "20260101" / "000000_collect.jsonl").write_text(
+        json.dumps(_asset("www.socar.kr", org="socar").to_dict()) + "\n"
+    )
+    cli.main(["collect", "-i", _config(tmp_path), "--org", "x",
+              "-o", str(out), "-q"])
+    capsys.readouterr()
+    newest = max((out).glob("*/*_collect.jsonl"), key=lambda p: (p.parent.name, p.name))
+    orgs = {r["org_id"] for r in read_jsonl(newest)}
+    assert orgs == {"x"}  # socar from the prior run was NOT carried in
+
+
 def test_fresh_discards_the_previous_run(tmp_path, no_network, monkeypatch, capsys):
     config = _config(tmp_path)
     out = str(tmp_path / "out")
@@ -183,6 +200,25 @@ def test_scan_writes_summary_without_liveness_bullets(
     summary = next((tmp_path / "out").glob("*/*_scan_summary.md")).read_text()
     assert "- [liveness]" not in summary
     assert "sensitive-host" in summary  # git.x.com was flagged
+
+
+def test_scan_org_scope_filters_assets(tmp_path, no_network, capsys):
+    """`scan --org x` on a mixed assets file must scan only x's assets."""
+    out = tmp_path / "out"
+    (out / "20260101").mkdir(parents=True)
+    mixed = out / "20260101" / "000000_collect.jsonl"
+    mixed.write_text(
+        json.dumps(_asset("git.x.com", org="x").to_dict()) + "\n"
+        + json.dumps(_asset("git.socar.kr", org="socar").to_dict()) + "\n"
+    )
+    code = cli.main([
+        "scan", "-i", _config(tmp_path), "--org", "x", "-o", str(out), "-q",
+        "--no-services", "--no-archive-bodies", "--min-severity", "low",
+    ])
+    capsys.readouterr()
+    assert code == 0
+    scan = read_jsonl(next(out.glob("*/*_scan.jsonl")))
+    assert scan and {f["org_id"] for f in scan} == {"x"}  # socar excluded
 
 
 def test_validate_reports_enabled_count(tmp_path, capsys):

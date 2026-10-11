@@ -117,12 +117,14 @@ exposure-lens collect --all-enabled --resume   # 끊긴 곳부터
 
 ```bash
 exposure-lens scan
+exposure-lens scan --org naver       # 섞인 collect에서도 naver 자산만 검사
 exposure-lens scan --assets output/20260928/143052_collect.jsonl
 exposure-lens scan --resume          # 끊긴 곳부터 (Shodan·아카이브 응답 재사용)
 ```
 
 | 옵션 | 설명 |
 | --- | --- |
+| `--org` / `--group` / `--all-enabled` | 입력 자산 중 해당 기관만 검사(생략 시 파일 전체). 여러 기관이 섞인 collect에서 한 기관만 돌릴 때 |
 | `--assets`, `-a` | 검사할 collect JSONL (생략 시 최신) |
 | `--min-severity` | 보고 하한 (기본 medium) |
 | `--no-services` | Shodan 현재-서비스 검사 생략 |
@@ -141,6 +143,7 @@ exposure-lens probe --scripts
 
 | 옵션 | 설명 |
 | --- | --- |
+| `--org` / `--group` / `--all-enabled` | 입력 자산·findings 중 해당 기관만 probe(생략 시 전체) |
 | `--scripts` | 클라이언트 코드(.js/.json/.map)만 |
 | `--only-findings` | 규칙 기준 critical/high URL만 |
 | `--assets`, `-a` | collect JSONL (생략 시 최신) |
